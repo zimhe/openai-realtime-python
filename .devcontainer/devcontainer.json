@@ -1,0 +1,29 @@
+{
+    "name": "Realtime Agent Dev Container",
+    "build": {
+      "dockerfile": "Dockerfile",
+      "context": ".."
+    },
+  
+    // 挂载当前目录到容器内的 /app（与 Dockerfile 的工作目录一致）
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+    "workspaceFolder": "/workspace",
+  
+    // 开发容器启动后自动安装的扩展
+    "customizations": {
+      "vscode": {
+        "extensions": [
+          "ms-python.python",  // Python 语言支持
+          "ms-python.vscode-pylance",  // Python 智能提示
+          "eamodio.gitlens"  // Git 协作增强（可选）
+        ]
+      }
+    },
+  
+    "postCreateCommand": "pip install -r requirements.txt", // 容器初始化命令
+  
+    // 端口转发（暴露开发所需端口）
+    "forwardPorts": [8080]
+
+  }
+  
