@@ -13,10 +13,12 @@ from agora_realtime_ai_api.rtc import Channel, ChatMessage, RtcEngine, RtcOption
 from .logger import setup_logger
 from .realtime.struct import ErrorMessage, FunctionCallOutputItemParam, InputAudioBufferCommitted, InputAudioBufferSpeechStarted, InputAudioBufferSpeechStopped, InputAudioTranscription, ItemCreate, ItemCreated, ItemInputAudioTranscriptionCompleted, RateLimitsUpdated, ResponseAudioDelta, ResponseAudioDone, ResponseAudioTranscriptDelta, ResponseAudioTranscriptDone, ResponseContentPartAdded, ResponseContentPartDone, ResponseCreate, ResponseCreated, ResponseDone, ResponseFunctionCallArgumentsDelta, ResponseFunctionCallArgumentsDone, ResponseOutputItemAdded, ResponseOutputItemDone, ServerVADUpdateParams, SessionUpdate, SessionUpdateParams, SessionUpdated, Voices, to_json
 from .realtime.connection import RealtimeApiConnection
+from .realtime.agent_functions import AgetnToolsMetaWorkplaces
 from .tools import ClientToolCallResponse, ToolContext
 from .utils import PCMWriter
 from agora_realtime_ai_api.rtc import AudioStream,PcmAudioFrame
 from agora.rtc.audio_pcm_data_sender import PcmAudioFrame
+from typing import Any, AsyncIterator
 
 # Set up the logger with color and timestamp support
 logger = setup_logger(name=__name__, log_level=logging.INFO)
@@ -52,7 +54,7 @@ class CombinedAudioStream:
         self.streams = streams
         self.index = 0
 
-    async def __aiter__(self):
+    def __aiter__(self)-> AsyncIterator[PcmAudioFrame]:
         return self
 
     async def __anext__(self) -> PcmAudioFrame:
@@ -147,8 +149,12 @@ class RealtimeKitAgent:
                 agent = cls(
                     connection=connection,
                     tools=tools,
-                    channel=channel,
+                    channel=channel
                 )
+                
+                if isinstance(tools, AgetnToolsMetaWorkplaces):
+                    tools.set_agent(agent)
+                
                 await agent.run()
 
         finally:
@@ -169,6 +175,7 @@ class RealtimeKitAgent:
         self.subscribe_users = []
         self.write_pcm = os.environ.get("WRITE_AGENT_PCM", "false") == "true"
         logger.info(f"Write PCM: {self.write_pcm}")
+        self.muted=False
 
     async def run(self) -> None:
         try:
@@ -212,8 +219,8 @@ class RealtimeKitAgent:
                 logger.info(f"User joined: {user_id}")
                 if user_id not in self.subscribe_users:
                     self.subscribe_users.append(user_id)
-                    logger.info(f"Subscribing to user {self.subscribe_user}")
-                    await self.channel.subscribe_audio(self.subscribe_user)
+                    logger.info(f"Subscribing to user {user_id}")
+                    await self.channel.subscribe_audio(user_id)
                     
             self.channel.on("user_joined", on_user_joined)
 
@@ -288,12 +295,15 @@ class RealtimeKitAgent:
 
         try:
             while True:
+               
                 # Get audio frame from the model output
                 frame = await self.audio_queue.get()
-
-                # Process sending audio (to RTC)
-                await self.channel.push_audio_frame(frame)
-
+                
+                if not self.muted:
+                    # Process sending audio (to RTC)
+                    await self.channel.push_audio_frame(frame)
+                    
+                    
                 # Write PCM data if enabled
                 await pcm_writer.write(frame)
 
