@@ -50,4 +50,4 @@ types-protobuf==4.25.0.20240417
 typing_extensions==4.12.2
 watchfiles==0.22.0
 yarl==1.12.1
-
+replicate==1.0.4

@@ -36,6 +36,7 @@ class StartAgentRequestBody(BaseModel):
     language: str = Field("en", description="The language of the agent")
     system_instruction: str = Field("", description="The system instruction for the agent")
     voice: str = Field("alloy", description="The voice of the agent")
+    screen_keys: list[str] = Field(default_factory=list, description="A list of screen keys in the channel context")
 
 
 class StopAgentRequestBody(BaseModel):
@@ -70,6 +71,7 @@ def run_agent_in_process(
     channel_name: str,
     uid: int,
     inference_config: InferenceConfig,
+    screen_keys: list[str] = None,
 ):  # Set up signal forwarding in the child process
     signal.signal(signal.SIGINT, handle_agent_proc_signal)  # Forward SIGINT
     signal.signal(signal.SIGTERM, handle_agent_proc_signal)  # Forward SIGTERM
@@ -85,7 +87,8 @@ def run_agent_in_process(
             ),
             inference_config=inference_config,
            
-            tools=AgetnToolsMetaWorkplaces() # tools example, replace with this line
+            tools=AgetnToolsMetaWorkplaces(), # tools example, replace with this line
+            screen_keys=screen_keys
         )
     )
 
@@ -108,6 +111,7 @@ async def start_agent(request):
         language = validated_data.language
         system_instruction = validated_data.system_instruction
         voice = validated_data.voice
+        screen_keys = validated_data.screen_keys
 
         # Check if a process is already running for the given channel_name
         if (
@@ -144,7 +148,7 @@ Your knowledge cutoff is 2023-10. You are a helpful, witty, and friendly AI. Act
         # Create a new process for running the agent
         process = Process(
             target=run_agent_in_process,
-            args=(app_id, app_cert, channel_name, uid, inference_config),
+            args=(app_id, app_cert, channel_name, uid, inference_config,screen_keys),
         )
 
         try:

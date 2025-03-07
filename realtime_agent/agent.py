@@ -105,6 +105,7 @@ class RealtimeKitAgent:
         options: RtcOptions,
         inference_config: InferenceConfig,
         tools: ToolContext | None,
+        screen_keys:list[str] = None,
     ) -> None:
         channel = engine.create_channel(options)
         await channel.connect()
@@ -154,6 +155,7 @@ class RealtimeKitAgent:
                 
                 if isinstance(tools, AgetnToolsMetaWorkplaces):
                     tools.set_agent(agent)
+                    tools.set_screen_context(screen_keys)
                 
                 await agent.run()
 
