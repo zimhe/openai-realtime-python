@@ -5,12 +5,14 @@ import os
 import signal
 from multiprocessing import Process
 
+from typing import Any
+
 from aiohttp import web
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
 
 from realtime_agent.realtime.tools_example import AgentTools
-from realtime_agent.realtime.agent_functions import AgetnToolsMetaWorkplaces
+from realtime_agent.realtime.agent_functions import AgentToolsMetaWorkplaces
 
 from .realtime.struct import PCM_CHANNELS, PCM_SAMPLE_RATE, ServerVADUpdateParams, Voices
 
@@ -19,12 +21,15 @@ from agora_realtime_ai_api.rtc import RtcEngine, RtcOptions
 from .logger import setup_logger
 from .parse_args import parse_args, parse_args_realtimekit
 
+
 # Set up the logger with color and timestamp support
 logger = setup_logger(name=__name__, log_level=logging.INFO)
 
 load_dotenv(override=True)
 app_id = os.environ.get("AGORA_APP_ID")
 app_cert = os.environ.get("AGORA_APP_CERT")
+
+agent_tools=AgentToolsMetaWorkplaces()
 
 if not app_id:
     raise ValueError("AGORA_APP_ID must be set in the environment.")
@@ -41,6 +46,11 @@ class StartAgentRequestBody(BaseModel):
 
 class StopAgentRequestBody(BaseModel):
     channel_name: str = Field(..., description="The name of the channel")
+    
+class ToolConfigRequestBody(BaseModel):
+    action: str = Field(..., description="The action to perform")
+    data: Any  = Field(..., description="The data for the action (string, dict, or list)")
+    
 
 
 # Function to monitor the process and perform extra work when it finishes
@@ -75,6 +85,7 @@ def run_agent_in_process(
 ):  # Set up signal forwarding in the child process
     signal.signal(signal.SIGINT, handle_agent_proc_signal)  # Forward SIGINT
     signal.signal(signal.SIGTERM, handle_agent_proc_signal)  # Forward SIGTERM
+    global agent_tools
     asyncio.run(
         RealtimeKitAgent.setup_and_run_agent(
             engine=RtcEngine(appid=engine_app_id, appcert=engine_app_cert),
@@ -87,12 +98,31 @@ def run_agent_in_process(
             ),
             inference_config=inference_config,
            
-            tools=AgetnToolsMetaWorkplaces(), # tools example, replace with this line
+            tools=agent_tools, # tools example, replace with this line
             screen_keys=screen_keys
         )
     )
 
 
+async def configurate_agent_tools(request):
+    global agent_tools
+    
+    if agent_tools is not None:
+        try:
+            data = await request.json()
+            tool_config = ToolConfigRequestBody(**data)
+            agent_tools.process_tool_config(tool_config.action, tool_config.data)
+            logger.info(f"Agent tools configured with action: {tool_config.action}")
+            return web.json_response({"status": "Agent tools configured successfully"})
+        except Exception as e:
+            logger.error(f"Failed to configure agent tools: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+    else:
+        print("Failed to configure agent tools: Agent tools not initialized")
+        return web.json_response({"error": "Agent tools not initialized"}, status=500)
+
+            
+            
 # HTTP Server Routes
 async def start_agent(request):
     try:
@@ -247,6 +277,10 @@ async def init_app():
 
     app.add_routes([web.post("/start_agent", start_agent)])
     app.add_routes([web.post("/stop_agent", stop_agent)])
+    app.add_routes([web.post("/agent_tool_config", configurate_agent_tools)])
+    
+    for route in app.router.routes():
+        print(route)
 
     return app
 

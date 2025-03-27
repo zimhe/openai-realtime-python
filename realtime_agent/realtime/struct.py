@@ -185,6 +185,7 @@ class EventType(str, Enum):
     ITEM_TRUNCATED = "conversation.item.truncated"
     ITEM_INPUT_AUDIO_TRANSCRIPTION_COMPLETED = "conversation.item.input_audio_transcription.completed"
     ITEM_INPUT_AUDIO_TRANSCRIPTION_FAILED = "conversation.item.input_audio_transcription.failed"
+    ITEM_INPUT_AUDIO_TRANSCRIPTION_DELTA= "conversation.item.input_audio_transcription.delta"
 
     RESPONSE_CREATED = "response.created"
     RESPONSE_CANCELLED = "response.cancelled"
@@ -473,6 +474,13 @@ class ResponseOutputItemDone(ServerToClientMessage):
     output_index: int  # Index of the output item in the response
     item: Union[ItemParam, None]  # The output item that was completed
     type: str = EventType.RESPONSE_OUTPUT_ITEM_DONE  # Fixed event type
+    
+@dataclass
+class ItemInputAudioTranscriptionDelta(ServerToClientMessage):
+    item_id: str  # The ID of the item for which transcription was completed
+    content_index: int  # Index of the content part that was transcribed
+    delta: str  # The transcribed text
+    type: str = EventType.ITEM_INPUT_AUDIO_TRANSCRIPTION_DELTA  # Fixed event type
 
 @dataclass
 class ItemInputAudioTranscriptionCompleted(ServerToClientMessage):
@@ -722,6 +730,8 @@ def parse_server_message(unparsed_string: str) -> ServerToClientMessage:
         return from_dict(ResponseContentPartDone, data)
     elif data["type"] == EventType.RESPONSE_OUTPUT_ITEM_DONE:
         return from_dict(ResponseOutputItemDone, data)
+    elif data["type"] == EventType.ITEM_INPUT_AUDIO_TRANSCRIPTION_DELTA:
+        return from_dict(ItemInputAudioTranscriptionDelta, data)
     elif data["type"] == EventType.ITEM_INPUT_AUDIO_TRANSCRIPTION_COMPLETED:
         return from_dict(ItemInputAudioTranscriptionCompleted, data)
     elif data["type"] == EventType.ITEM_INPUT_AUDIO_TRANSCRIPTION_FAILED:

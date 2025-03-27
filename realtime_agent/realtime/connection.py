@@ -6,7 +6,7 @@ import os
 import aiohttp
 
 from typing import Any, AsyncGenerator
-from .struct import InputAudioBufferAppend, ClientToServerMessage, ServerToClientMessage, parse_server_message, to_json
+from .struct import InputAudioBufferAppend, ClientToServerMessage, ServerToClientMessage,UserMessageItemParam,ItemCreate, parse_server_message, to_json
 from ..logger import setup_logger
 
 # Set up the logger with color and timestamp support
@@ -75,6 +75,14 @@ class RealtimeApiConnection:
         """audio_data is assumed to be pcm16 24kHz mono little-endian"""
         base64_audio_data = base64.b64encode(audio_data).decode("utf-8")
         message = InputAudioBufferAppend(audio=base64_audio_data)
+        await self.send_request(message)
+        
+    async def send_text(self, text: str):
+        item = UserMessageItemParam(
+        content=[{"type": "input_text", "text": text}]
+        )
+        message = ItemCreate(item=item)
+        
         await self.send_request(message)
 
     async def send_request(self, message: ClientToServerMessage):
