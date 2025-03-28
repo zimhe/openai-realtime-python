@@ -366,12 +366,13 @@ class RealtimeKitAgent:
                     # loop.call_soon_threadsafe(self.audio_queue.put_nowait, base64.b64decode(message.delta))
                     logger.debug(f"TMS:ResponseAudioDelta: response_id:{message.response_id},item_id: {message.item_id}")
                 case ResponseAudioTranscriptDelta():
-                    # logger.info(f"Received text message {message=}")
-                    asyncio.create_task(self.channel.chat.send_message(
-                        ChatMessage(
-                            message=to_json(message), msg_id=message.item_id
-                        )
-                    ))
+                    # # logger.info(f"Received text message {message=}")
+                    # asyncio.create_task(self.channel.chat.send_message(
+                    #     ChatMessage(
+                    #         message=to_json(message), msg_id=message.item_id
+                    #     )
+                    # ))
+                    pass
 
                 case ResponseAudioTranscriptDone():
                     logger.info(f"Text message done: {message=}")
