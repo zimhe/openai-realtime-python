@@ -261,11 +261,6 @@ class RealtimeKitAgent:
             logging.error(f"Error Sending stream message: {e}")
             
             
-    def _handle_parsed_stream_message(self, json_data: dict[str, Any]) -> None:
-        if "t2i_condition" in json_data:
-            self.tools.t2i_condition=json_data["t2i_condition"]
-            
-            
     async def rtc_to_model(self) -> None:
         # 等待至少有一个用户的音频流可用
         while not self.multi_user_audio_stream.has_streams():

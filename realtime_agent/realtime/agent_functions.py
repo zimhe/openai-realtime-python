@@ -19,6 +19,7 @@ from openai import OpenAI
 
 t2i_api="black-forest-labs/flux-dev"
 t2i_condition_api="black-forest-labs/flux-canny-dev"
+tqa_api="black-forest-labs/flux-tqa-dev"
 
 class AgentToolsMetaWorkplaces(ToolContext):
     def __init__(self) -> None:
@@ -178,7 +179,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
 
     async def _text2image(self,prompt: str,screen_id:int=-1) -> dict[str, Any]:
         try:
-            input = { "prompt": prompt,"guidance": 3.5,"output_format":"png","aspect_ratio":"16:9","control_image":self.t2i_condition}
+            input = { "prompt": prompt,"guidance": 3.5,"output_format":"png","aspect_ratio":"16:9"}
             
             output=await replicate.async_run(t2i_api,input,use_file_output=False)
             
@@ -190,8 +191,6 @@ class AgentToolsMetaWorkplaces(ToolContext):
             result={"text_to_image_output":output[0],"screen_key":screen_key}
             
             msg_id=uuid.uuid4().hex
-            
-            
             
             chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
             
@@ -321,4 +320,11 @@ class AgentToolsMetaWorkplaces(ToolContext):
             return {
                 "status": "error",
                 "message": f"Failed to fetch search results: {str(e)}",
+            }
+    async def _interpert_image(self,image_url:str,query: str) -> dict[str, Any]:
+         result="Success"
+         return {
+                "status": "success",
+                "message": f"Search results for '{query}': {result}",
+                "result": result,
             }
