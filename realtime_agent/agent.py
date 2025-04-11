@@ -205,6 +205,7 @@ class RealtimeKitAgent:
                 agora_rtc_conn: RTCConnection, user_id: int
             ):
                 logger.info(f"User joined: {user_id}")
+                
                 if user_id not in self.subscribe_users:
                     self.subscribe_users.append(user_id)
                     logger.info(f"Subscribing to user {user_id}")
@@ -227,9 +228,7 @@ class RealtimeKitAgent:
             asyncio.create_task(self.rtc_to_model()).add_done_callback(log_exception)
             asyncio.create_task(self.model_to_rtc()).add_done_callback(log_exception)
 
-            asyncio.create_task(self._process_model_messages()).add_done_callback(
-                log_exception
-            )
+            asyncio.create_task(self._process_model_messages()).add_done_callback(log_exception)
 
             await disconnected_future
             logger.info("Agent finished running")
@@ -240,20 +239,8 @@ class RealtimeKitAgent:
             logger.error(f"Error running agent: {e}")
             raise
         
-    def _get_audio_streams_for_users(self) -> (list[AudioStream]|None):
-        audio_streams = []
-        has_any_audio = False 
-        for user_id in self.subscribe_users:
-            audio_stream=self.channel.get_audio_frames(user_id)
-            print(f"user_id:{user_id}, audio_stream:{audio_stream}")
-            if audio_stream is not None:
-                audio_streams.append(audio_stream)
-                has_any_audio = True
-                
-        if not has_any_audio:
-            return None  
-        return audio_streams
-    
+
+
     async def _process_stream_message(self,  user_id, stream_id, data, length) -> None:
         try:
           await self.connection.send_text(data)
@@ -305,6 +292,32 @@ class RealtimeKitAgent:
             #         await pcm_writer.write(audio_frame.data)
 
             #         await asyncio.sleep(0)  # Yield control to allow other tasks to run
+
+        except asyncio.CancelledError:
+            # Write any remaining PCM data before exiting
+            await pcm_writer.flush()
+            raise  # Re-raise the exception to propagate cancellation
+
+    
+    async def rtc_to_model_for_user(self, user_id:int) -> None:
+        while self.channel.get_audio_frames(user_id) is None:
+            await asyncio.sleep(0.1)
+
+        audio_frames = self.channel.get_audio_frames(user_id)
+
+        # Initialize PCMWriter for receiving audio
+        pcm_writer = PCMWriter(prefix="rtc_to_model", write_pcm=self.write_pcm)
+
+        try:
+            async for audio_frame in audio_frames:
+                # Process received audio (send to model)
+                _monitor_queue_size(self.audio_queue, "audio_queue")
+                await self.connection.send_audio_data(audio_frame.data)
+
+                # Write PCM data if enabled
+                await pcm_writer.write(audio_frame.data)
+
+                await asyncio.sleep(0)  # Yield control to allow other tasks to run
 
         except asyncio.CancelledError:
             # Write any remaining PCM data before exiting

@@ -76,6 +76,7 @@ class RealtimeApiConnection:
         base64_audio_data = base64.b64encode(audio_data).decode("utf-8")
         message = InputAudioBufferAppend(audio=base64_audio_data)
         await self.send_request(message)
+        #return message.event_id
         
     async def send_text(self, text: str):
         item = UserMessageItemParam(

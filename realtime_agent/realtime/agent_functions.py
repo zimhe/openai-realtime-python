@@ -18,8 +18,9 @@ from openai import OpenAI
 # This is an example of how to add a new function to the agent tools.
 
 t2i_api="black-forest-labs/flux-dev"
-t2i_condition_api="black-forest-labs/flux-canny-dev"
-tqa_api="black-forest-labs/flux-tqa-dev"
+t2i_condition_api="black-forest-labs/flux-depth-pro"
+aliyun_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
+aliyun_model_id="qwen2.5-vl-7b-instruct"
 
 class AgentToolsMetaWorkplaces(ToolContext):
     def __init__(self) -> None:
@@ -31,6 +32,11 @@ class AgentToolsMetaWorkplaces(ToolContext):
         self.openai_client=OpenAI()
         self.history_images={}
         self.t2i_condition_queue=asyncio.Queue()
+        self.aliyun_client=OpenAI(
+            base_url=aliyun_url,
+            api_key=os.environ.get("ALIYUN_API_KEY")
+            )
+        
         # create multiple functions here as per requirement
         self.register_function(
             name="set_mute_state",
@@ -114,13 +120,33 @@ class AgentToolsMetaWorkplaces(ToolContext):
         )
         
         self.register_function(
-            name="get_history_image_keys",
+            name="get_history_image_info",
             description="get the history images info with json format that uses prompt as key and image url as value",
             parameters={
                 "type": "object",
                 "properties": {},
             },
             fn=self._get_history_images_info,
+        )
+        
+        self.register_function(
+            name="interpert_image",
+            description="interpert the image with given query, the image url should be a valid url",
+            parameters={
+                "type":"object",
+                "properties":{
+                    "image_url":{
+                        "type":"string",
+                        "description":"the image url that needs to be interpreted"
+                    },
+                    "query":{
+                        "type":"string",
+                        "description":"the query that needs to be interpreted"
+                    }
+                },
+                "required":["image_url","query"]
+            },
+            fn=self._interpert_image,
         )
     
     def process_tool_config(self,action:str,data):
@@ -216,7 +242,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
  
             input = { 
                      "prompt": prompt,
-                     "guidance": 3.5,
+                     "guidance": 7,
                      "output_format":"png",
                      "aspect_ratio":"16:9",
                      "control_image":condition_url
@@ -322,9 +348,43 @@ class AgentToolsMetaWorkplaces(ToolContext):
                 "message": f"Failed to fetch search results: {str(e)}",
             }
     async def _interpert_image(self,image_url:str,query: str) -> dict[str, Any]:
-         result="Success"
-         return {
+        message={
+            "role": "user",
+            "content":[
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image_url,
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": query,
+                }
+            ]
+        }
+         
+        try:
+            completion = self.aliyun_client.chat.completions.create(
+                model=aliyun_model_id,
+                stream=False,
+                max_tokens=512,
+                temperature=0.7,
+                messages=[message]
+            )
+            
+            data = json.loads(completion.model_dump_json())
+            result = data["choices"][0]["message"]["content"]
+            
+            return {
                 "status": "success",
                 "message": f"Search results for '{query}': {result}",
                 "result": result,
             }
+
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Failed to interpret image: {str(e)}",
+            }
+         

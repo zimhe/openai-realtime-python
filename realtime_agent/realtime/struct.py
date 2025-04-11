@@ -71,6 +71,13 @@ class ServerVADUpdateParams:
     prefix_padding_ms: Optional[int] = None  # Amount of padding before the voice starts (in milliseconds)
     silence_duration_ms: Optional[int] = None  # Duration of silence before considering speech stopped (in milliseconds)
     type: str = "server_vad"  # Fixed value for VAD type
+    
+@dataclass
+class SemanticVADUpdateParams:
+    type: str = "semantic_vad"  # Fixed value for VAD type
+    eagerness:str="auto"  # Eagerness level for VAD (e.g., "normal", "aggressive")	
+    
+    
 @dataclass
 class Session:
     id: str  # The unique identifier for the session
@@ -80,7 +87,7 @@ class Session:
     modalities: Set[str] = field(default_factory=lambda: {"text", "audio"})  # Set of allowed modalities (e.g., "text", "audio")
     instructions: Optional[str] = None  # Instructions or guidance for the session
     voice: Voices = Voices.Alloy  # Voice configuration for audio responses, defaulting to "Alloy"
-    turn_detection: Optional[ServerVADUpdateParams] = None  # Voice activity detection (VAD) settings
+    turn_detection: Optional[ServerVADUpdateParams|SemanticVADUpdateParams] = None  # Voice activity detection (VAD) settings
     input_audio_format: AudioFormats = AudioFormats.PCM16  # Audio format for input (e.g., "pcm16")
     output_audio_format: AudioFormats = AudioFormats.PCM16  # Audio format for output (e.g., "pcm16")
     input_audio_transcription: Optional[InputAudioTranscription] = None  # Audio transcription model settings (e.g., "whisper-1")
