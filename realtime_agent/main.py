@@ -171,8 +171,11 @@ Your knowledge cutoff is 2023-10. You are a helpful, witty, and friendly AI. Act
         inference_config = InferenceConfig(
             system_message=system_message,
             voice=voice,
-            turn_detection=ServerVADUpdateParams(
-                type="server_vad", threshold=0.5, prefix_padding_ms=300, silence_duration_ms=200
+            # turn_detection=ServerVADUpdateParams(
+            #     type="server_vad", threshold=0.5, prefix_padding_ms=300, silence_duration_ms=200
+            # ),
+            turn_detection=SemanticVADUpdateParams(
+                type="semantic_vad", eagerness="low",create_response=False
             ),
         )
         # Create a new process for running the agent

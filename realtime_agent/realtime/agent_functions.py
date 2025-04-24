@@ -37,31 +37,6 @@ class AgentToolsMetaWorkplaces(ToolContext):
             api_key=os.environ.get("ALIYUN_API_KEY")
             )
         
-        # create multiple functions here as per requirement
-        self.register_function(
-            name="set_mute_state",
-            description="set the agent to be muted or unmuted, True for muted, False for unmuted", 
-            parameters={
-                "type": "object",
-                "properties": {
-                    "mute_state": {
-                        "type": "boolean",
-                        "description": "the mute state, True for muted, False for unmuted",
-                    },
-                },
-            },
-            fn=self._set_mute_state,
-        )
-        
-        self.register_function(
-            name="check_mute_state",
-            description="check the current mute state of the agent, the agent can check if it's currently muted or not when user ask the agent for response.",
-            parameters={
-                "type": "object",
-                "properties": {},
-            },
-            fn=self._check_mute_state,
-        )
 
         self.register_function(
             name="text_to_image",
@@ -109,7 +84,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
         
         self.register_function(
             name="get_web_search_results",
-            description="perform an online search for relevant information based on given query keywords",
+            description="perform an online search for relevant information based on given query keywords, can be used when ever the user querys something that is not in the local knowledge base, the function will return a json object with the search results",
             parameters={
                 "type": "object",
                 "properties": {
@@ -166,42 +141,12 @@ class AgentToolsMetaWorkplaces(ToolContext):
         
     def set_screen_context(self,screen_keys):
         self.screen_keys=screen_keys
-
-    async def _set_mute_state(self,mute_state:bool)-> dict[str, Any]:
         
-        try:
-            self.agent.muted=mute_state
-            return {
-                "status": "success",
-                "message": f"Set mute state to {mute_state} successfully.",
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to set mute state to {mute_state}",
-            }
-            
-    async def _check_mute_state(self)-> dict[str, Any]:
-        try:
-            
-            mute_state=""
-            
-            if self.agent.muted:
-                mute_state="Agent is muted now, the users won't hear the agent's voice."
-            else:
-                mute_state="Agent is unmuted now, the users can hear the agent's voice."
-            
-            return {
-                "status": "success",
-                "message": mute_state,
-                "result": self.agent.muted,
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to get mute state",
-            }
-            
+    
+    def format_t2i_result(self, output, screen_key):
+        result={"type":"text2image.output","output":output,"screen_key":screen_key}
+        return result
+
 
     async def _text2image(self,prompt: str,screen_id:int=-1) -> dict[str, Any]:
         try:
@@ -214,7 +159,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
             if screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
                 screen_key=self.screen_keys[proper_screen_id]
             
-            result={"text_to_image_output":output[0],"screen_key":screen_key}
+            result=self.format_t2i_result(output[0],screen_key)
             
             msg_id=uuid.uuid4().hex
             
@@ -237,25 +182,26 @@ class AgentToolsMetaWorkplaces(ToolContext):
             
             
     
+    
     async def _text2image_condition(self,prompt: str,condition_url:str,screen_id:int=-1) -> dict[str, Any]:
         try:
  
             input = { 
                      "prompt": prompt,
-                     "guidance": 7,
+                     "guidance": 3,
                      "output_format":"png",
                      "aspect_ratio":"16:9",
-                     "control_image":condition_url
+                     "image":condition_url
                      }
             
-            output=await replicate.async_run(t2i_condition_api,input,use_file_output=False)
+            output=await replicate.async_run(t2i_api,input,use_file_output=False)
             
             screen_key=None
             proper_screen_id=screen_id-1
             if screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
                 screen_key=self.screen_keys[proper_screen_id]
             
-            result={"text_to_image_output":output[0],"screen_key":screen_key}
+            result=self.format_t2i_result(output[0],screen_key)
             
             msg_id=uuid.uuid4().hex
             

@@ -11,7 +11,7 @@ from attr import dataclass
 from agora_realtime_ai_api.rtc import Channel, ChatMessage, RtcEngine, RtcOptions
 
 from .logger import setup_logger
-from .realtime.struct import ErrorMessage, FunctionCallOutputItemParam, InputAudioBufferCommitted, InputAudioBufferSpeechStarted, InputAudioBufferSpeechStopped, InputAudioTranscription, ItemCreate, ItemCreated, ItemInputAudioTranscriptionDelta,ItemInputAudioTranscriptionCompleted, RateLimitsUpdated, ResponseAudioDelta, ResponseAudioDone, ResponseAudioTranscriptDelta, ResponseAudioTranscriptDone, ResponseContentPartAdded, ResponseContentPartDone, ResponseCreate, ResponseCreated, ResponseDone, ResponseFunctionCallArgumentsDelta, ResponseFunctionCallArgumentsDone, ResponseOutputItemAdded, ResponseOutputItemDone, ServerVADUpdateParams, SessionUpdate, SessionUpdateParams, SessionUpdated, Voices, to_json
+from .realtime.struct import ErrorMessage, FunctionCallOutputItemParam, InputAudioBufferCommitted, InputAudioBufferSpeechStarted, InputAudioBufferSpeechStopped, InputAudioTranscription, ItemCreate, ItemCreated, ItemInputAudioTranscriptionDelta,ItemInputAudioTranscriptionCompleted, RateLimitsUpdated, ResponseAudioDelta, ResponseAudioDone, ResponseAudioTranscriptDelta, ResponseAudioTranscriptDone, ResponseContentPartAdded, ResponseContentPartDone, ResponseCreate, ResponseCreated, ResponseDone, ResponseFunctionCallArgumentsDelta, ResponseFunctionCallArgumentsDone, ResponseOutputItemAdded, ResponseOutputItemDone, ServerVADUpdateParams, SessionUpdate, SessionUpdateParams, SessionUpdated, Voices, to_json,to_dict,dict_to_json
 from .realtime.connection import RealtimeApiConnection
 from .realtime.agent_functions import AgentToolsMetaWorkplaces
 from .tools import ClientToolCallResponse, ToolContext
@@ -20,7 +20,9 @@ from .multi_user_audio_stream import MultiUserAudioStream
 from agora_realtime_ai_api.rtc import AudioStream,PcmAudioFrame
 from agora.rtc.audio_pcm_data_sender import PcmAudioFrame
 from typing import Any, AsyncIterator
+from difflib import SequenceMatcher
 import json
+import time
 
 # Set up the logger with color and timestamp support
 logger = setup_logger(name=__name__, log_level=logging.INFO)
@@ -50,6 +52,16 @@ async def wait_for_remote_user(channel: Channel) -> int:
     except Exception as e:
         logger.error(f"Error waiting for remote user: {e}")
         raise
+
+def contains_fuzzy_phrase(text, phrase, threshold=0.8):
+    words = text.split()
+    phrase_len = len(phrase.split())
+    for i in range(len(words) - phrase_len + 1):
+        window = " ".join(words[i:i + phrase_len])
+        ratio = SequenceMatcher(None, window, phrase).ratio()
+        if ratio >= threshold:
+            return True
+    return False
 
 @dataclass(frozen=True, kw_only=True)
 class InferenceConfig:
@@ -154,9 +166,11 @@ class RealtimeKitAgent:
         self.subscribe_users = []
         self.write_pcm = os.environ.get("WRITE_AGENT_PCM", "false") == "true"
         logger.info(f"Write PCM: {self.write_pcm}")
-        self.muted=False
+        self.last_trigger_time = 0
+        self.ACTIVE_WINDOW_SECONDS = 30  # 你可以自定义时间长度
+
         # 创建多用户音频流管理器
-        self.multi_user_audio_stream = MultiUserAudioStream(channel)
+        #self.multi_user_audio_stream = MultiUserAudioStream(channel)
 
     async def run(self) -> None:
         try:
@@ -182,10 +196,11 @@ class RealtimeKitAgent:
             logger.info(f"Subscribing to user {any_user}")
             self.channel.local_user.subscribe_all_audio()
             await self.channel.subscribe_audio(any_user)
+            asyncio.create_task(self.rtc_to_model_for_user(user_id=any_user)).add_done_callback(log_exception)
             
-            await self.multi_user_audio_stream.update_users(self.subscribe_users)
+            #await self.multi_user_audio_stream.update_users(self.subscribe_users)
             # 启动音频流处理
-            await self.multi_user_audio_stream.start()
+            #await self.multi_user_audio_stream.start()
 
             async def on_user_left(
                 agora_rtc_conn: RTCConnection, user_id: int, reason: int
@@ -194,7 +209,7 @@ class RealtimeKitAgent:
                 if user_id in self.subscribe_users:
                     self.subscribe_users.remove(user_id)
                     logger.info(f"Subscribed user {user_id} left, removed from user list")
-                    await self.multi_user_audio_stream.update_users(self.subscribe_users)
+                    #await self.multi_user_audio_stream.update_users(self.subscribe_users)
                     if len(self.subscribe_users) == 0:
                         logger.info("No more users to subscribe to, disconnecting")
                         await self.channel.disconnect()
@@ -208,10 +223,9 @@ class RealtimeKitAgent:
                 
                 if user_id not in self.subscribe_users:
                     self.subscribe_users.append(user_id)
-                    logger.info(f"Subscribing to user {user_id}")
                     await self.channel.subscribe_audio(user_id)
                     logger.info(f"Subscribed to user {user_id}, current users: {self.subscribe_users}")
-                    await self.multi_user_audio_stream.update_users(self.subscribe_users)
+                    asyncio.create_task(self.rtc_to_model_for_user(user_id=user_id)).add_done_callback(log_exception)
                     
             self.channel.on("user_joined", on_user_joined)
 
@@ -225,7 +239,7 @@ class RealtimeKitAgent:
 
             self.channel.on("connection_state_changed", callback)
 
-            asyncio.create_task(self.rtc_to_model()).add_done_callback(log_exception)
+            #asyncio.create_task(self.rtc_to_model()).add_done_callback(log_exception)
             asyncio.create_task(self.model_to_rtc()).add_done_callback(log_exception)
 
             asyncio.create_task(self._process_model_messages()).add_done_callback(log_exception)
@@ -304,17 +318,16 @@ class RealtimeKitAgent:
             await asyncio.sleep(0.1)
 
         audio_frames = self.channel.get_audio_frames(user_id)
-
+        
         # Initialize PCMWriter for receiving audio
-        pcm_writer = PCMWriter(prefix="rtc_to_model", write_pcm=self.write_pcm)
+        pcm_writer = PCMWriter(prefix=f"rtc_to_model_for_user_{user_id}", write_pcm=self.write_pcm)
 
         try:
             async for audio_frame in audio_frames:
                 # Process received audio (send to model)
                 _monitor_queue_size(self.audio_queue, "audio_queue")
                 await self.connection.send_audio_data(audio_frame.data)
-
-                # Write PCM data if enabled
+                
                 await pcm_writer.write(audio_frame.data)
 
                 await asyncio.sleep(0)  # Yield control to allow other tasks to run
@@ -330,15 +343,11 @@ class RealtimeKitAgent:
 
         try:
             while True:
-               
                 # Get audio frame from the model output
                 frame = await self.audio_queue.get()
+                # Process sending audio (to RTC)
+                await self.channel.push_audio_frame(frame)
                 
-                if not self.muted:
-                    # Process sending audio (to RTC)
-                    await self.channel.push_audio_frame(frame)
-                    
-                    
                 # Write PCM data if enabled
                 await pcm_writer.write(frame)
 
@@ -374,16 +383,15 @@ class RealtimeKitAgent:
                     # loop.call_soon_threadsafe(self.audio_queue.put_nowait, base64.b64decode(message.delta))
                     logger.debug(f"TMS:ResponseAudioDelta: response_id:{message.response_id},item_id: {message.item_id}")
                 case ResponseAudioTranscriptDelta():
-                    # # logger.info(f"Received text message {message=}")
-                    # asyncio.create_task(self.channel.chat.send_message(
-                    #     ChatMessage(
-                    #         message=to_json(message), msg_id=message.item_id
-                    #     )
-                    # ))
-                    pass
+                    #logger.info(f"Received text message {message=}")
+                    asyncio.create_task(self.channel.chat.send_message(
+                        ChatMessage(
+                            message=to_json(message), msg_id=message.item_id
+                        )
+                    ))
 
                 case ResponseAudioTranscriptDone():
-                    logger.info(f"Text message done: {message=}")
+                    logger.info(f"ResponseAudioTranscriptDone: {message=}")
                     asyncio.create_task(self.channel.chat.send_message(
                         ChatMessage(
                             message=to_json(message), msg_id=message.item_id
@@ -402,13 +410,37 @@ class RealtimeKitAgent:
                     pass
                 case ItemInputAudioTranscriptionCompleted():
                     logger.info(f"ItemInputAudioTranscriptionCompleted: {message=}")
+
+                    # message_dict=to_dict(message)
+                    # message_dict["uid"]=uid
+                    message_json=to_json(message)
                     asyncio.create_task(self.channel.chat.send_message(
                         ChatMessage(
-                            message=to_json(message), msg_id=message.item_id
+                            message=message_json, msg_id=message.item_id
                         )
                     ))
+                    
+                    transcript=message.transcript.lower().strip()
+                    trigger_phrases = ["hey agent", "hi agent", "hello agent"]
+                    
+                    current_time = time.time()  
+                    
+                    in_active_window = (current_time - self.last_trigger_time) < self.ACTIVE_WINDOW_SECONDS
+                    
+                    if any(contains_fuzzy_phrase(transcript, phrase) for phrase in trigger_phrases):
+                        logger.info("Trigger word detected, sending response.create")
+                        self.last_trigger_time = current_time
+                        await self.connection.send_request(ResponseCreate())
+                    elif in_active_window:
+                        logger.info("Still in active window. Responding without trigger phrase.")
+                        await self.connection.send_request(ResponseCreate())
+                    else:
+                        logger.info("Trigger word not found, skipping response")
+                    
+                    
                 #  InputAudioBufferCommitted
                 case InputAudioBufferCommitted():
+                    logger.info(f"InputAudioBufferCommitted: {message=}")
                     pass
                 case ItemCreated():
                     pass
@@ -440,6 +472,7 @@ class RealtimeKitAgent:
                 case RateLimitsUpdated():
                     pass
                 case ResponseFunctionCallArgumentsDone():
+                    #logger.info(f"ResponseFunctionCallArgumentsDone: {message=}")
                     asyncio.create_task(
                         self.handle_funtion_call(message)
                     )

@@ -76,6 +76,8 @@ class ServerVADUpdateParams:
 class SemanticVADUpdateParams:
     type: str = "semantic_vad"  # Fixed value for VAD type
     eagerness:str="auto"  # Eagerness level for VAD (e.g., "normal", "aggressive")	
+    create_response:bool=True
+    interrupt_response:bool=True
     
     
 @dataclass
@@ -748,3 +750,9 @@ def parse_server_message(unparsed_string: str) -> ServerToClientMessage:
     
 def to_json(obj: Union[ClientToServerMessage, ServerToClientMessage]) -> str:
     return json.dumps(asdict(obj))
+
+def to_dict(obj: Union[ClientToServerMessage, ServerToClientMessage]) -> Dict[str, Any]:
+    return asdict(obj)
+
+def dict_to_json(obj: Dict[str, Any]) -> str:
+    return json.dumps(obj)
