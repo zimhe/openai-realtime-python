@@ -167,6 +167,7 @@ class RealtimeKitAgent:
         self.write_pcm = os.environ.get("WRITE_AGENT_PCM", "false") == "true"
         logger.info(f"Write PCM: {self.write_pcm}")
         self.last_trigger_time = 0
+        self.last_response_time=0
         self.ACTIVE_WINDOW_SECONDS = 30  # 你可以自定义时间长度
 
         # 创建多用户音频流管理器
@@ -181,6 +182,21 @@ class RealtimeKitAgent:
                         "unhandled exception",
                         exc_info=t.exception(),
                     )
+                    
+            async def on_user_joined(
+                agora_rtc_conn: RTCConnection, user_id: int
+            ):
+                logger.info(f"On User Joined Callback: {user_id}")
+                
+                if user_id not in self.subscribe_users:
+                    self.subscribe_users.append(user_id)
+                    await self.channel.subscribe_audio(user_id)
+                    asyncio.create_task(self.rtc_to_model_for_user(user_id=user_id)).add_done_callback(log_exception)
+                    logger.info(f"Subscribed to user {user_id}, current users: {self.subscribe_users}")
+              
+                    
+            self.channel.on("user_joined", on_user_joined)
+
 
             async def on_stream_message(agora_local_user, user_id, stream_id, data, length) -> None:
                 logger.info(f"Received stream message data {data} with length: {length}")
@@ -192,16 +208,14 @@ class RealtimeKitAgent:
             logger.info("Waiting for remote user to join")
             
             any_user = await wait_for_remote_user(self.channel)
-            self.subscribe_users.append(any_user)
-            logger.info(f"Subscribing to user {any_user}")
-            self.channel.local_user.subscribe_all_audio()
-            await self.channel.subscribe_audio(any_user)
-            asyncio.create_task(self.rtc_to_model_for_user(user_id=any_user)).add_done_callback(log_exception)
+            if not any_user in self.subscribe_users:
+                self.subscribe_users.append(any_user)
+                #self.channel.local_user.subscribe_all_audio()
+                await self.channel.subscribe_audio(any_user)
+                asyncio.create_task(self.rtc_to_model_for_user(user_id=any_user)).add_done_callback(log_exception)
+                logger.info(f"Subscribed to user outside <on_user_joined> {any_user}")
             
-            #await self.multi_user_audio_stream.update_users(self.subscribe_users)
-            # 启动音频流处理
-            #await self.multi_user_audio_stream.start()
-
+            
             async def on_user_left(
                 agora_rtc_conn: RTCConnection, user_id: int, reason: int
             ):
@@ -216,19 +230,7 @@ class RealtimeKitAgent:
 
             self.channel.on("user_left", on_user_left)
             
-            async def on_user_joined(
-                agora_rtc_conn: RTCConnection, user_id: int
-            ):
-                logger.info(f"User joined: {user_id}")
-                
-                if user_id not in self.subscribe_users:
-                    self.subscribe_users.append(user_id)
-                    await self.channel.subscribe_audio(user_id)
-                    logger.info(f"Subscribed to user {user_id}, current users: {self.subscribe_users}")
-                    asyncio.create_task(self.rtc_to_model_for_user(user_id=user_id)).add_done_callback(log_exception)
-                    
-            self.channel.on("user_joined", on_user_joined)
-
+            
             disconnected_future = asyncio.Future[None]()
 
             def callback(agora_rtc_conn: RTCConnection, conn_info: RTCConnInfo, reason):
@@ -314,7 +316,9 @@ class RealtimeKitAgent:
 
     
     async def rtc_to_model_for_user(self, user_id:int) -> None:
+        logger.info(f"rtc_to_model_for_user started: {user_id=}")
         while self.channel.get_audio_frames(user_id) is None:
+            logger.info(f"No audio frames for user: {user_id}, waiting...")
             await asyncio.sleep(0.1)
 
         audio_frames = self.channel.get_audio_frames(user_id)
@@ -421,11 +425,11 @@ class RealtimeKitAgent:
                     ))
                     
                     transcript=message.transcript.lower().strip()
-                    trigger_phrases = ["hey agent", "hi agent", "hello agent"]
+                    trigger_phrases = ["hey agent", "hi agent", "hello agent","hi, assistant","hey assistant","hello assistant"]
                     
                     current_time = time.time()  
                     
-                    in_active_window = (current_time - self.last_trigger_time) < self.ACTIVE_WINDOW_SECONDS
+                    in_active_window = (current_time - self.last_trigger_time) < self.ACTIVE_WINDOW_SECONDS or (current_time - self.last_response_time) < self.ACTIVE_WINDOW_SECONDS
                     
                     if any(contains_fuzzy_phrase(transcript, phrase) for phrase in trigger_phrases):
                         logger.info("Trigger word detected, sending response.create")
@@ -446,6 +450,7 @@ class RealtimeKitAgent:
                     pass
                 # ResponseCreated
                 case ResponseCreated():
+                    self.last_response_time = time.time()
                     pass
                 # ResponseDone
                 case ResponseDone():
