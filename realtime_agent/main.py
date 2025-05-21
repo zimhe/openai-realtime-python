@@ -280,7 +280,8 @@ async def init_app():
 
     app.add_routes([web.post("/start_agent", start_agent)])
     app.add_routes([web.post("/stop_agent", stop_agent)])
-    app.add_routes([web.post("/agent_tool_config", configurate_agent_tools)])
+    # app.add_routes([web.post("/mcp",None)])
+    # app.add_routes([web.get("/unity_ws",None)])
     
     for route in app.router.routes():
         print(route)

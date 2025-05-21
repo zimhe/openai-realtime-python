@@ -19,6 +19,7 @@ from openai import OpenAI
 
 t2i_api="black-forest-labs/flux-dev"
 t2i_condition_api="black-forest-labs/flux-depth-pro"
+t2i_image_mask_api="black-forest-labs/flux-fill-pro"
 aliyun_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
 aliyun_model_id="qwen2.5-vl-7b-instruct"
 
@@ -60,7 +61,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
         
         self.register_function(
             name="text_to_image_condition",
-            description="generate image from text prompt and given condition image, if user gives a screen number, the function should also specify a <screen_id> in the args, so that the image will be sent to the screen", 
+            description="generate image from text prompt and given condition image, the prompt should be refined with delicate details for better quality.if user gives a screen number, the function should also specify a <screen_id> in the args, so that the image will be sent to the screen", 
             parameters={
                 "type": "object",
                 "properties": {
@@ -80,6 +81,34 @@ class AgentToolsMetaWorkplaces(ToolContext):
                 "required":["prompt","condition_url"]
             },
             fn=self._text2image_condition,
+        )
+        
+        self.register_function(
+            name="refine_masked_area_of_image",
+            description="re-generate the masked area in the given image from text prompt and given condition image, the prompt should be refined with delicate details for better quality.if user gives a screen number, the function should also specify a <screen_id> in the args, so that the result image will be sent to the screen", 
+            parameters={
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "the text prompt for generating image",
+                    },
+                    "image_url":{
+                        "type": "string",
+                        "description": "the image url for the base image to modify",
+                    },
+                      "mask_url":{
+                        "type": "string",
+                        "description": "the mask image url for defining the area to be redrawn",
+                    },
+                    "screen_id": {
+                        "type": "integer",
+                        "description": "Optional, the screen index to cast the image to if user wants to put the image to a particular screen, this argument should be specified in the args",
+                    }
+                },
+                "required":["prompt","image_url","mask_url"]
+            },
+            fn=self._refine_image_with_mask,
         )
         
         self.register_function(
@@ -148,9 +177,10 @@ class AgentToolsMetaWorkplaces(ToolContext):
         return result
 
 
+
     async def _text2image(self,prompt: str,screen_id:int=-1) -> dict[str, Any]:
         try:
-            input = { "prompt": prompt,"guidance": 3.5,"output_format":"png","aspect_ratio":"16:9"}
+            input = { "prompt": prompt,"guidance": 3.5,"output_format":"png","aspect_ratio":"16:9","steps": 50 }
             
             output=await replicate.async_run(t2i_api,input,use_file_output=False)
             
@@ -180,49 +210,90 @@ class AgentToolsMetaWorkplaces(ToolContext):
                 "message": f"Failed to get : {str(e)}",
             }
             
-            
-    
-    
-    async def _text2image_condition(self,prompt: str,condition_url:str,screen_id:int=-1) -> dict[str, Any]:
-        try:
- 
-            input = { 
-                     "prompt": prompt,
-                     "guidance": 3,
-                     "output_format":"png",
-                     "aspect_ratio":"16:9",
-                     "image":condition_url
-                     }
-            
-            output=await replicate.async_run(t2i_api,input,use_file_output=False)
-            
-            screen_key=None
-            proper_screen_id=screen_id-1
-            if screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
-                screen_key=self.screen_keys[proper_screen_id]
-            
-            result=self.format_t2i_result(output[0],screen_key)
-            
-            msg_id=uuid.uuid4().hex
-            
-            chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
-            
-            self.history_images[prompt]=output[0]
-            
-            await self.channel.chat.send_message(chat_message)
-            
-            return {
-                "status": "success",
-                "message": f"text to image success, the result is {output[0]}",
-                "result": output[0],
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to get : {str(e)}",
-            }
             
 
+    async def _text2image_condition(self,prompt: str,condition_url:str,screen_id:int=-1) -> dict[str, Any]:
+        try:
+            
+            input = { 
+                     "prompt": prompt,
+                     "guidance": 7,
+                     "output_format":"png",
+                     "control_image":condition_url
+                     }
+            
+            output=await replicate.async_run(t2i_condition_api,input,use_file_output=False)
+            
+            screen_key=None
+            proper_screen_id=screen_id-1
+            if screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
+                screen_key=self.screen_keys[proper_screen_id]
+            
+            result=self.format_t2i_result(output[0],screen_key)
+            
+            msg_id=uuid.uuid4().hex
+            
+            chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
+            
+            self.history_images[prompt]=output[0]
+            
+            await self.channel.chat.send_message(chat_message)
+            
+            return {
+                "status": "success",
+                "message": f"text to image success, the result is {output[0]}",
+                "result": output[0],
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Failed to get : {str(e)}",
+            }
+            
+            
+    async def _refine_image_with_mask(self,prompt:str,image_url:str,mask_url:str,screen_id:int=-1)-> dict[str, Any]:
+        try:
+
+            input={
+                    "mask": mask_url,
+                    "image": image_url,
+                    "steps": 50,
+                    "prompt": prompt,
+                    "guidance": 60,
+                    "outpaint": "None",
+                    "output_format": "png",
+                    "safety_tolerance": 2,
+                    "prompt_upsampling": False
+                }
+            
+            output=await replicate.async_run(t2i_image_mask_api,input,use_file_output=False)
+            
+            screen_key=None
+            proper_screen_id=screen_id-1
+            if screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
+                screen_key=self.screen_keys[proper_screen_id]
+            
+            result=self.format_t2i_result(output,screen_key)
+            
+            msg_id=uuid.uuid4().hex
+            
+            chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
+            
+            self.history_images[prompt]=output
+            
+            await self.channel.chat.send_message(chat_message)
+            
+            return {
+                "status": "success",
+                "message": f"refine image success, the result is {output}",
+                "result": output,
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Failed to get : {str(e)}",
+            }
+    
             
     async def _get_history_images_info(self)-> dict[str, Any]:
         try:
