@@ -224,18 +224,23 @@ class AgentToolsMetaWorkplaces(ToolContext):
             
             output=await replicate.async_run(t2i_condition_api,input,use_file_output=False)
             
+            if isinstance(output, list):
+                output=output[0]  # Ensure we get the first image if multiple are returned
+            
+           
+            
             screen_key=None
             proper_screen_id=screen_id-1
             if screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
                 screen_key=self.screen_keys[proper_screen_id]
             
-            result=self.format_t2i_result(output[0],screen_key)
+            result=self.format_t2i_result(output,screen_key)
             
             msg_id=uuid.uuid4().hex
             
             chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
             
-            self.history_images[prompt]=output[0]
+            self.history_images[prompt]=output
             
             await self.channel.chat.send_message(chat_message)
             
