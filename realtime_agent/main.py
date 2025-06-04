@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
 
 from realtime_agent.realtime.tools_example import AgentTools
-from realtime_agent.realtime.agent_functions import AgentToolsMetaWorkplaces
+from realtime_agent.realtime.agent_functions import AgentToolsMetaWorkplaces,t2i_api
 
 from .realtime.struct import PCM_CHANNELS, PCM_SAMPLE_RATE, ServerVADUpdateParams, SemanticVADUpdateParams,Voices
 
@@ -20,6 +20,8 @@ from .agent import InferenceConfig, RealtimeKitAgent
 from agora_realtime_ai_api.rtc import RtcEngine, RtcOptions
 from .logger import setup_logger
 from .parse_args import parse_args, parse_args_realtimekit
+
+import replicate
 
 
 # Set up the logger with color and timestamp support
@@ -121,8 +123,24 @@ async def configurate_agent_tools(request):
         print("Failed to configure agent tools: Agent tools not initialized")
         return web.json_response({"error": "Agent tools not initialized"}, status=500)
 
-            
-            
+
+async def text2image(request):
+        try:
+            data = await request.json()
+            image=data.get("input_image")
+            if not image:
+                data.pop("input_image", None)  
+                
+            logger.info(f"Received Text to Image Request: {data}")
+            output=await replicate.async_run(t2i_api,data,use_file_output=False)
+            logger.info(f"Generate Image Success: {output}")
+            return web.json_response({"status": "success", "message": "Text to image generation successful", "result": output})
+        
+        except Exception as e:
+            logger.error(f"Failed To Generate Image: {e}")
+            return web.json_response({"error": f"Failed To Generate Image : {str(e)}, "}, status=500)
+
+
 # HTTP Server Routes
 async def start_agent(request):
     try:
@@ -280,6 +298,7 @@ async def init_app():
 
     app.add_routes([web.post("/start_agent", start_agent)])
     app.add_routes([web.post("/stop_agent", stop_agent)])
+    app.add_routes([web.post("/text2image", text2image)])
     # app.add_routes([web.post("/mcp",None)])
     # app.add_routes([web.get("/unity_ws",None)])
     

@@ -476,7 +476,7 @@ class RealtimeKitAgent:
                 case RateLimitsUpdated():
                     pass
                 case ResponseFunctionCallArgumentsDone():
-                    #logger.info(f"ResponseFunctionCallArgumentsDone: {message=}")
+                    logger.info(f"ResponseFunctionCallArgumentsDone: {message=}")
                     asyncio.create_task(
                         self.handle_funtion_call(message)
                     )

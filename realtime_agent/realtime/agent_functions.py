@@ -17,7 +17,7 @@ from openai import OpenAI
 # Function calling Example
 # This is an example of how to add a new function to the agent tools.
 
-t2i_api="black-forest-labs/flux-dev"
+t2i_api="black-forest-labs/flux-kontext-pro"
 t2i_condition_api="black-forest-labs/flux-depth-pro"
 t2i_image_mask_api="black-forest-labs/flux-fill-pro"
 aliyun_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -41,7 +41,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
 
         self.register_function(
             name="text_to_image",
-            description="generate image from text prompt, if user gives a screen number, the function should also specify a <screen_id> in the args, so that the image will be sent to the screen", 
+            description="generate image from natural language prompt, if user gives a screen number, the function should also specify a <screen_id> in the args, so that the image will be sent to the screen", 
             parameters={
                 "type": "object",
                 "properties": {
@@ -60,8 +60,8 @@ class AgentToolsMetaWorkplaces(ToolContext):
         )
         
         self.register_function(
-            name="text_to_image_condition",
-            description="generate image from text prompt and given condition image, the prompt should be refined with delicate details for better quality.if user gives a screen number, the function should also specify a <screen_id> in the args, so that the image will be sent to the screen", 
+            name="refine_this_image",
+            description="refine this image with natural language prompts.if user gives a screen number, the function should also specify a <screen_id> in the args, so that the image will be sent to the screen", 
             parameters={
                 "type": "object",
                 "properties": {
@@ -69,7 +69,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
                         "type": "string",
                         "description": "the text prompt for generating image",
                     },
-                    "condition_url":{
+                    "input_image":{
                         "type": "string",
                         "description": "the condition image url for generating image",
                     },
@@ -78,9 +78,9 @@ class AgentToolsMetaWorkplaces(ToolContext):
                         "description": "Optional, the screen index to cast the image to if user wants to put the image to a particular screen, this argument should be specified in the args",
                     }
                 },
-                "required":["prompt","condition_url"]
+                "required":["prompt","input_image"]
             },
-            fn=self._text2image_condition,
+            fn=self._refine_this_image,
         )
         
         self.register_function(
@@ -180,7 +180,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
 
     async def _text2image(self,prompt: str,screen_id:int=-1) -> dict[str, Any]:
         try:
-            input = { "prompt": prompt,"guidance": 3.5,"output_format":"png","aspect_ratio":"16:9","steps": 50 }
+            input = { "prompt": prompt,"output_format":"png","aspect_ratio":"16:9" }
             
             output=await replicate.async_run(t2i_api,input,use_file_output=False)
             
@@ -212,17 +212,16 @@ class AgentToolsMetaWorkplaces(ToolContext):
             
             
 
-    async def _text2image_condition(self,prompt: str,condition_url:str,screen_id:int=-1) -> dict[str, Any]:
+    async def _refine_this_image(self,prompt: str,input_image:str,screen_id:int=-1) -> dict[str, Any]:
         try:
-            
             input = { 
                      "prompt": prompt,
-                     "guidance": 7,
+                     "aspect_ratio":"match_input_image",
                      "output_format":"png",
-                     "control_image":condition_url
+                     "input_image":input_image
                      }
             
-            output=await replicate.async_run(t2i_condition_api,input,use_file_output=False)
+            output=await replicate.async_run(t2i_api,input,use_file_output=False)
             
             if isinstance(output, list):
                 output=output[0]  # Ensure we get the first image if multiple are returned
