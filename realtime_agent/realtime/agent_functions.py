@@ -172,13 +172,13 @@ class AgentToolsMetaWorkplaces(ToolContext):
         self.screen_keys=screen_keys
         
     
-    def format_t2i_result(self, output, screen_key):
-        result={"type":"text2image.output","output":output,"screen_key":screen_key}
+    def format_t2i_result(self, output, screen_key,item_id):
+        result={"type":"text2image.output","output":output,"screen_key":screen_key,"item_id":item_id}
         return result
 
 
 
-    async def _text2image(self,prompt: str,screen_id:int=-1) -> dict[str, Any]:
+    async def _text2image(self,prompt:str,screen_id:int=-1) -> dict[str, Any]:
         try:
             input = { "prompt": prompt,"output_format":"png","aspect_ratio":"16:9" }
             
@@ -189,13 +189,16 @@ class AgentToolsMetaWorkplaces(ToolContext):
             if screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
                 screen_key=self.screen_keys[proper_screen_id]
             
-            result=self.format_t2i_result(output[0],screen_key)
+            if isinstance(output, list):
+                output=output[0]  # Ensure we get the first image if multiple are returned
             
             msg_id=uuid.uuid4().hex
             
+            result=self.format_t2i_result(output,screen_key,msg_id)
+            
             chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
             
-            self.history_images[prompt]=output[0]
+            self.history_images[prompt]=output
             
             await self.channel.chat.send_message(chat_message)
             
@@ -226,16 +229,15 @@ class AgentToolsMetaWorkplaces(ToolContext):
             if isinstance(output, list):
                 output=output[0]  # Ensure we get the first image if multiple are returned
             
-           
-            
+
             screen_key=None
             proper_screen_id=screen_id-1
             if screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
                 screen_key=self.screen_keys[proper_screen_id]
             
-            result=self.format_t2i_result(output,screen_key)
             
             msg_id=uuid.uuid4().hex
+            result=self.format_t2i_result(output,screen_key,msg_id)
             
             chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
             
@@ -261,7 +263,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
             input={
                     "mask": mask_url,
                     "image": image_url,
-                    "steps": 50,
+                    "steps": 30,
                     "prompt": prompt,
                     "guidance": 60,
                     "outpaint": "None",
@@ -277,9 +279,12 @@ class AgentToolsMetaWorkplaces(ToolContext):
             if screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
                 screen_key=self.screen_keys[proper_screen_id]
             
-            result=self.format_t2i_result(output,screen_key)
+            if isinstance(output, list):
+                output=output[0]  # Ensure we get the first image if multiple are returned
             
             msg_id=uuid.uuid4().hex
+            
+            result=self.format_t2i_result(output,screen_key,msg_id)
             
             chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
             
@@ -323,7 +328,9 @@ class AgentToolsMetaWorkplaces(ToolContext):
             
             msg_id=uuid.uuid4().hex
             
-            chat_message=ChatMessage(message=json.dumps({"text_to_image_output":image_url}),msg_id=msg_id)
+            result=self.format_t2i_result(image_url,screen_key,msg_id)
+            
+            chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
             
             await self.channel.chat.send_message(chat_message)
             

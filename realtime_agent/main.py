@@ -23,6 +23,8 @@ from .parse_args import parse_args, parse_args_realtimekit
 
 import replicate
 
+import openai
+
 
 # Set up the logger with color and timestamp support
 logger = setup_logger(name=__name__, log_level=logging.INFO)
@@ -139,7 +141,23 @@ async def text2image(request):
         except Exception as e:
             logger.error(f"Failed To Generate Image: {e}")
             return web.json_response({"error": f"Failed To Generate Image : {str(e)}, "}, status=500)
-
+ 
+#TODO: Implement chat function using OpenAI's gpt-4o model        
+async def chat(request):
+        """
+        本地函数: 通过 OpenAI 的 gpt-4o 模型进行聊天查询
+        :param request: HTTP 请求对象
+        """
+        
+        try:
+            data = await request.json()
+            query = data.get("query")
+            return web.json_response({"status": "success", "message": None})
+        
+        except Exception as e:
+            logger.error(f"Generate Response: {e}")
+            return web.json_response({"error": f"Generate Response : {str(e)}, "}, status=500)
+    
 
 # HTTP Server Routes
 async def start_agent(request):
