@@ -17,6 +17,7 @@ from .realtime.agent_functions import AgentToolsMetaWorkplaces
 from .tools import ClientToolCallResponse, ToolContext
 from .utils import PCMWriter
 from .multi_user_audio_stream import MultiUserAudioStream
+from .active_speaker_audio_stream import ActiveSpeakerAudioStream
 from agora_realtime_ai_api.rtc import AudioStream,PcmAudioFrame
 from agora.rtc.audio_pcm_data_sender import PcmAudioFrame
 from typing import Any, AsyncIterator
@@ -170,11 +171,14 @@ class RealtimeKitAgent:
         logger.info(f"Write PCM: {self.write_pcm}")
         self.last_trigger_time = 0
         self.last_response_time=0
-        self.ACTIVE_WINDOW_SECONDS = 30  # 你可以自定义时间长度
+        self.ACTIVE_WINDOW_SECONDS = 10  # 你可以自定义时间长度
 
         #创建多用户音频流管理器
-        self.multi_user_audio_stream = MultiUserAudioStream(channel)
-       
+        self.multi_user_audio_stream = ActiveSpeakerAudioStream(channel)
+        
+        self.MENTION_PATTERN = "<color=#FF4500><b>@agent</b></color>"
+        self.TRIGGER_PHRASES=["hey agent", "hi agent", "hello agent","hi, assistant","hey assistant","hello assistant"]
+        self.STOP_PHRASES=["stop", "cancel", "nevermind", "never mind", "abort", "quiet", "shut up", "be quiet","stop talking","mute"]
 
     async def run(self) -> None:
         try:
@@ -424,13 +428,20 @@ class RealtimeKitAgent:
                     ))
                     
                     transcript=message.transcript.lower().strip()
-                    trigger_phrases = ["hey agent", "hi agent", "hello agent","hi, assistant","hey assistant","hello assistant"]
+                    #trigger_phrases = ["hey agent", "hi agent", "hello agent","hi, assistant","hey assistant","hello assistant"]
+                    #stop_phrases = ["stop", "cancel", "nevermind", "never mind", "abort", "quiet", "shut up", "be quiet","stop talking","mute"]
+                    
+                    if any(contains_fuzzy_phrase(transcript, phrase) for phrase in  self.STOP_PHRASES):
+                        logger.info("Stop phrase detected. Aborting response.")
+                        self.last_trigger_time = 0
+                        self.last_response_time = 0
+                        pass
                     
                     current_time = time.time()  
                     
                     in_active_window = (current_time - self.last_trigger_time) < self.ACTIVE_WINDOW_SECONDS or (current_time - self.last_response_time) < self.ACTIVE_WINDOW_SECONDS
                     
-                    if any(contains_fuzzy_phrase(transcript, phrase) for phrase in trigger_phrases):
+                    if any(contains_fuzzy_phrase(transcript, phrase) for phrase in self.TRIGGER_PHRASES):
                         logger.info("Trigger word detected, sending response.create")
                         self.last_trigger_time = current_time
                         await self.connection.send_request(ResponseCreate())
@@ -446,7 +457,19 @@ class RealtimeKitAgent:
                     logger.info(f"InputAudioBufferCommitted: {message=}")
                     pass
                 case ItemCreated():
-                    pass
+                    if message.item.role == "user":
+                        logger.info(f"ItemCreated: {message.item=}")
+                        
+                        content= message.item.content
+                        text=content[0].get("text", "")
+                        if not text:
+                            logger.warning(f"ItemCreated: No text found in item {message.item.id}")
+                            pass
+                        
+                        if self.MENTION_PATTERN in text:
+                            logger.info(f"ItemCreated: Mention pattern found in item {message.item.id}, sending response.create")
+                            await self.connection.send_request(ResponseCreate())
+                            
                 # ResponseCreated
                 case ResponseCreated():
                     self.last_response_time = time.time()
