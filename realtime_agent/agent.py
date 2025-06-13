@@ -428,8 +428,6 @@ class RealtimeKitAgent:
                     ))
                     
                     transcript=message.transcript.lower().strip()
-                    #trigger_phrases = ["hey agent", "hi agent", "hello agent","hi, assistant","hey assistant","hello assistant"]
-                    #stop_phrases = ["stop", "cancel", "nevermind", "never mind", "abort", "quiet", "shut up", "be quiet","stop talking","mute"]
                     
                     if any(contains_fuzzy_phrase(transcript, phrase) for phrase in  self.STOP_PHRASES):
                         logger.info("Stop phrase detected. Aborting response.")
@@ -457,17 +455,20 @@ class RealtimeKitAgent:
                     logger.info(f"InputAudioBufferCommitted: {message=}")
                     pass
                 case ItemCreated():
-                    if message.item.role == "user":
+                    item = message.item  # item 是 dict 类型
+
+                    if item.get("role") == "user":
                         logger.info(f"ItemCreated: {message.item=}")
+                    
+                        content = item.get("content", [])
+                        text = content[0].get("text", "") if content else ""
                         
-                        content= message.item.content
-                        text=content[0].get("text", "")
                         if not text:
-                            logger.warning(f"ItemCreated: No text found in item {message.item.id}")
+                            logger.warning(f"ItemCreated: No text found in item {item=}")
                             pass
                         
                         if self.MENTION_PATTERN in text:
-                            logger.info(f"ItemCreated: Mention pattern found in item {message.item.id}, sending response.create")
+                            logger.info(f"ItemCreated: Mention pattern found in item {item=}, sending response.create")
                             await self.connection.send_request(ResponseCreate())
                             
                 # ResponseCreated
