@@ -171,7 +171,7 @@ class RealtimeKitAgent:
         logger.info(f"Write PCM: {self.write_pcm}")
         self.last_trigger_time = 0
         self.last_response_time=0
-        self.ACTIVE_WINDOW_SECONDS = 10  # 你可以自定义时间长度
+        self.ACTIVE_WINDOW_SECONDS = 20  # 你可以自定义时间长度
 
         #创建多用户音频流管理器
         self.multi_user_audio_stream = ActiveSpeakerAudioStream(channel)
@@ -464,7 +464,7 @@ class RealtimeKitAgent:
                         text = content[0].get("text", "") if content else ""
                         
                         if not text:
-                            logger.warning(f"ItemCreated: No text found in item {item=}")
+                            #logger.warning(f"ItemCreated: No text found in item {item=}")
                             pass
                         
                         if self.MENTION_PATTERN in text:
