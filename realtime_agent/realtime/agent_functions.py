@@ -23,6 +23,8 @@ t2i_image_mask_api="black-forest-labs/flux-fill-pro"
 aliyun_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
 aliyun_model_id="qwen2.5-vl-7b-instruct"
 
+T2I_OUTPUT="text2image.output"
+
 class AgentToolsMetaWorkplaces(ToolContext):
     def __init__(self) -> None:
         super().__init__()
@@ -41,7 +43,10 @@ class AgentToolsMetaWorkplaces(ToolContext):
 
         self.register_function(
             name="text_to_image",
-            description="generate image from natural language prompt, if user gives a screen number, the function should also specify a <screen_id> in the args, so that the image will be sent to the screen", 
+            description='''generate image from natural language prompt, 
+            the prompt should be refined with delicate details for better quality.
+            if user specifies a screen number, the function should also specify a <screen_id> in the args,
+            the screen_id should be specified as a number, use 1, 2, 3... for the screen index, or -2 for the selected screen''', 
             parameters={
                 "type": "object",
                 "properties": {
@@ -51,7 +56,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
                     },
                     "screen_id": {
                         "type": "integer",
-                        "description": "Optional, the screen index to cast the image to if user wants to put the image to a particular screen, this argument should be specified in the args",
+                        "description": "Optional, the screen index to cast the image to if user wants to put the image to a specified screen, use numeric index if user specified a numer, or use <-2> if user says put to the 'selected screen'",
                     }
                 },
                 "required":["prompt"]
@@ -61,7 +66,11 @@ class AgentToolsMetaWorkplaces(ToolContext):
         
         self.register_function(
             name="refine_this_image",
-            description="refine this image with natural language prompts.if user gives a screen number, the function should also specify a <screen_id> in the args, so that the image will be sent to the screen", 
+            description='''refine this image with natural language prompts.
+            the prompt should be refined with delicate details for better quality.
+            if user specifies a screen number, the function should also specify a <screen_id> in the args,
+            the screen_id should be specified as a number, use 1, 2, 3... for the screen index, or -2 for the selected screen
+            ''', 
             parameters={
                 "type": "object",
                 "properties": {
@@ -75,7 +84,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
                     },
                     "screen_id": {
                         "type": "integer",
-                        "description": "Optional, the screen index to cast the image to if user wants to put the image to a particular screen, this argument should be specified in the args",
+                        "description": "Optional, the screen index to cast the image to if user wants to put the image to a specified screen, use numeric index if user specified a numer, or use <-2> if user says put to the 'selected screen'",
                     }
                 },
                 "required":["prompt","input_image"]
@@ -85,7 +94,11 @@ class AgentToolsMetaWorkplaces(ToolContext):
         
         self.register_function(
             name="refine_masked_area_of_image",
-            description="re-generate the masked area in the given image from text prompt and given condition image, the prompt should be refined with delicate details for better quality.if user gives a screen number, the function should also specify a <screen_id> in the args, so that the result image will be sent to the screen", 
+            description='''re-generate the masked area in the given image from text prompt and given condition image, 
+            the prompt should be refined with delicate details for better quality.
+            if user specifies a screen number, the function should also specify a <screen_id> in the args,
+            the screen_id should be specified as a number, use 1, 2, 3... for the screen index, or -2 for the selected screen
+            ''', 
             parameters={
                 "type": "object",
                 "properties": {
@@ -103,7 +116,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
                     },
                     "screen_id": {
                         "type": "integer",
-                        "description": "Optional, the screen index to cast the image to if user wants to put the image to a particular screen, this argument should be specified in the args",
+                        "description": "Optional, the screen index to cast the image to if user wants to put the image to a specified screen, use numeric index if user specified a numer, or use <-2> if user says put to the 'selected screen'",
                     }
                 },
                 "required":["prompt","image_url","mask_url"]
@@ -125,12 +138,12 @@ class AgentToolsMetaWorkplaces(ToolContext):
         
         self.register_function(
             name="get_history_image_info",
-            description="get the history images info with json format that uses prompt as key and image url as value",
+            description="get the history images info with json format, can be used to when user queries the previous generation records, the function will return a json object with the history images info, including the message id, the prompt and image url",
             parameters={
                 "type": "object",
                 "properties": {},
             },
-            fn=self._get_history_images_info,
+            fn=self._get_history_images_data,
         )
         
         self.register_function(
@@ -151,6 +164,26 @@ class AgentToolsMetaWorkplaces(ToolContext):
                 "required":["image_url","query"]
             },
             fn=self._interpert_image,
+        )
+        
+        self.register_function(
+            name="cast_image_to_screen",
+            description="cast the image to a specific screen, the image url should be a valid url, and the screen_id should be specified, numbers 1, 2, 3... for the screen index, or -2 for the selected screen",
+            parameters={
+                "type":"object",
+                "properties":{
+                    "image_url":{
+                        "type":"string",
+                        "description":"the image url that needs to be casted"
+                    },
+                    "screen_id": {
+                        "type": "integer",
+                        "description": "the screen index to cast the image to if user wants to put the image to a specified screen, use numeric index if user specified a numer, or use <-2> if user says put to the 'selected screen'",
+                    }
+                },
+                "required":["image_url","screen_id"]
+            },
+            fn=self._cast_image_to_screen,
         )
     
     def process_tool_config(self,action:str,data):
@@ -173,10 +206,12 @@ class AgentToolsMetaWorkplaces(ToolContext):
         
     
     def format_t2i_result(self, output, screen_key,item_id):
-        result={"type":"text2image.output","output":output,"screen_key":screen_key,"item_id":item_id}
+        result={"type":T2I_OUTPUT,"output":output,"screen_key":screen_key,"item_id":item_id}
         return result
-
-
+    
+    def append_history_image(self,msg_id:str,prompt:str,image_url:str):
+        self.history_images[msg_id]={"prompt": prompt, "image_url": image_url}
+        
 
     async def _text2image(self,prompt:str,screen_id:int=-1) -> dict[str, Any]:
         try:
@@ -186,7 +221,10 @@ class AgentToolsMetaWorkplaces(ToolContext):
             
             screen_key=None
             proper_screen_id=screen_id-1
-            if screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
+            
+            if screen_id==-2:
+                screen_key="selected"
+            elif screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
                 screen_key=self.screen_keys[proper_screen_id]
             
             if isinstance(output, list):
@@ -198,7 +236,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
             
             chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
             
-            self.history_images[prompt]=output
+            self.append_history_image(msg_id,prompt,output)
             
             await self.channel.chat.send_message(chat_message)
             
@@ -232,7 +270,10 @@ class AgentToolsMetaWorkplaces(ToolContext):
 
             screen_key=None
             proper_screen_id=screen_id-1
-            if screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
+            
+            if screen_id==-2:
+                screen_key="selected"
+            elif screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
                 screen_key=self.screen_keys[proper_screen_id]
             
             
@@ -241,13 +282,13 @@ class AgentToolsMetaWorkplaces(ToolContext):
             
             chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
             
-            self.history_images[prompt]=output
+            self.append_history_image(msg_id,prompt,output)
             
             await self.channel.chat.send_message(chat_message)
             
             return {
                 "status": "success",
-                "message": f"text to image success, the result is {output[0]}",
+                "message": f"text to image success, the result is {output}",
                 "result": output[0],
             }
         except Exception as e:
@@ -276,8 +317,12 @@ class AgentToolsMetaWorkplaces(ToolContext):
             
             screen_key=None
             proper_screen_id=screen_id-1
-            if screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
+            
+            if screen_id==-2:
+                screen_key="selected"
+            elif screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
                 screen_key=self.screen_keys[proper_screen_id]
+            
             
             if isinstance(output, list):
                 output=output[0]  # Ensure we get the first image if multiple are returned
@@ -288,7 +333,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
             
             chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
             
-            self.history_images[prompt]=output
+            self.append_history_image(msg_id,prompt,output)
             
             await self.channel.chat.send_message(chat_message)
             
@@ -304,13 +349,13 @@ class AgentToolsMetaWorkplaces(ToolContext):
             }
     
             
-    async def _get_history_images_info(self)-> dict[str, Any]:
+    async def _get_history_images_data(self)-> dict[str, Any]:
         try:
-            image_info=json.dumps(self.history_images)
+            history_info=json.dumps(self.history_images)
             return {
                 "status": "success",
                 "message": f"Get history images info success",
-                "result": image_info,
+                "result": history_info,
             }
         except Exception as e:
             return {
@@ -406,7 +451,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
             
             return {
                 "status": "success",
-                "message": f"Search results for '{query}': {result}",
+                "message": f"Image interpertation for '{query}': {result}",
                 "result": result,
             }
 

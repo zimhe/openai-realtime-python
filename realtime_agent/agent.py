@@ -8,7 +8,8 @@ from typing import Any, List, Optional, Dict, Union
 from agora.rtc.rtc_connection import RTCConnection, RTCConnInfo
 from attr import dataclass
 
-from agora_realtime_ai_api.rtc import Channel, ChatMessage, RtcEngine, RtcOptions
+from agora_realtime_ai_api.rtc import ChatMessage, RtcOptions
+from .agora_mixed.rtc_mixed import MixedChannel,MixedRtcEngine
 
 from .logger import setup_logger
 from .realtime.struct import ErrorMessage, FunctionCallOutputItemParam, InputAudioBufferCommitted, InputAudioBufferSpeechStarted, InputAudioBufferSpeechStopped, InputAudioTranscription, ItemCreate, ItemCreated, ItemInputAudioTranscriptionDelta,ItemInputAudioTranscriptionCompleted, RateLimitsUpdated, ResponseAudioDelta, ResponseAudioDone, ResponseAudioTranscriptDelta, ResponseAudioTranscriptDone, ResponseContentPartAdded, ResponseContentPartDone, ResponseCreate, ResponseCreated, ResponseDone, ResponseFunctionCallArgumentsDelta, ResponseFunctionCallArgumentsDone, ResponseOutputItemAdded, ResponseOutputItemDone, ServerVADUpdateParams, SessionUpdate, SessionUpdateParams, SessionUpdated, Voices, to_json,to_dict,dict_to_json
@@ -34,7 +35,7 @@ def _monitor_queue_size(queue: asyncio.Queue, queue_name: str, threshold: int = 
         logger.warning(f"Queue {queue_name} size exceeded {threshold}: current size {queue_size}")
 
 
-async def wait_for_remote_users(channel: Channel, timeout: float = 15.0) -> List[int]:
+async def wait_for_remote_users(channel: MixedChannel, timeout: float = 15.0) -> List[int]:
     remote_users = list(channel.remote_users.keys())
     if remote_users:
         return remote_users
@@ -73,8 +74,8 @@ class InferenceConfig:
 
 
 class RealtimeKitAgent:
-    engine: RtcEngine
-    channel: Channel
+    engine: MixedRtcEngine
+    channel: MixedChannel
     connection: RealtimeApiConnection
     audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
 
@@ -92,7 +93,7 @@ class RealtimeKitAgent:
     async def setup_and_run_agent(
         cls,
         *,
-        engine: RtcEngine,
+        engine: MixedRtcEngine,
         options: RtcOptions,
         inference_config: InferenceConfig,
         tools: ToolContext | None,
@@ -160,7 +161,7 @@ class RealtimeKitAgent:
         *,
         connection: RealtimeApiConnection,
         tools: ToolContext | None,
-        channel: Channel,
+        channel: MixedChannel,
     ) -> None:
         self.connection = connection
         self.tools = tools
@@ -174,7 +175,7 @@ class RealtimeKitAgent:
         self.ACTIVE_WINDOW_SECONDS = 20  # 你可以自定义时间长度
 
         #创建多用户音频流管理器
-        self.multi_user_audio_stream = ActiveSpeakerAudioStream(channel)
+        #self.multi_user_audio_stream = ActiveSpeakerAudioStream(channel)
         
         self.MENTION_PATTERN = "<color=#FF4500><b>@agent</b></color>"
         self.TRIGGER_PHRASES=["hey agent", "hi agent", "hello agent","hi, assistant","hey assistant","hello assistant"]
@@ -199,7 +200,7 @@ class RealtimeKitAgent:
                     self.subscribe_users.add(user_id)
                     await self.channel.subscribe_audio(user_id)
                     logger.info(f"Subscribed to user {user_id}, current users: {self.subscribe_users}")
-                    await self.multi_user_audio_stream.update_users(self.subscribe_users)
+                    #await self.multi_user_audio_stream.update_users(self.subscribe_users)
               
                     
             self.channel.on("user_joined", on_user_joined)
@@ -221,7 +222,7 @@ class RealtimeKitAgent:
                     self.subscribe_users.add(user_id)
                     logger.info(f"Subscribed to user outside <on_user_joined> {user_id}, current users: {self.subscribe_users}")
 
-            await self.multi_user_audio_stream.update_users(self.subscribe_users)
+            #await self.multi_user_audio_stream.update_users(self.subscribe_users)
            
             # if not any_user in self.subscribe_users:
             #     self.subscribe_users.add(any_user)
@@ -231,7 +232,7 @@ class RealtimeKitAgent:
                 
             #     await self.multi_user_audio_stream.update_users(self.subscribe_users)
                 
-            await self.multi_user_audio_stream.start()
+            ##await self.multi_user_audio_stream.start()
             
             
             async def on_user_left(
@@ -241,11 +242,12 @@ class RealtimeKitAgent:
                 if user_id in self.subscribe_users:
                     self.subscribe_users.discard(user_id)
                     logger.info(f"Subscribed user {user_id} left, removed from user list")
-                    await self.multi_user_audio_stream.update_users(self.subscribe_users)
+                    #await self.multi_user_audio_stream.update_users(self.subscribe_users)
                     if len(self.subscribe_users) == 0:
                         logger.info("No more users to subscribe to, disconnecting")
+                        self.channel.channel_event_observer.mixed_audio_stream.put_nowait(None)
                         await self.channel.disconnect()
-                        await self.multi_user_audio_stream.stop()
+                        #await self.multi_user_audio_stream.stop()
 
             self.channel.on("user_left", on_user_left)
             
@@ -284,34 +286,26 @@ class RealtimeKitAgent:
             
     async def rtc_to_model(self) -> None:
         # 等待至少有一个用户的音频流可用
-        while not self.multi_user_audio_stream.has_streams():
+        while not self.subscribe_users or self.channel.get_mixed_audio_frames() is None:
             await asyncio.sleep(0.1)
-
+            
+        audio_frames = self.channel.get_mixed_audio_frames()
+        
+        
         # Initialize PCMWriter for receiving audio
         pcm_writer = PCMWriter(prefix="rtc_to_model", write_pcm=self.write_pcm)
         
         try:
-            
-             # 持续处理音频帧
-            while True:
-                audio_frame = await self.multi_user_audio_stream.get_next_frame()
-                
-                if audio_frame is None:
-                    # 如果没有可用的音频帧，稍等片刻再尝试
-                    #logger.info("No audio frame available, waiting...")
-                    await asyncio.sleep(0.01)
-                    continue
-                
-                # 处理接收到的音频
+            async for audio_frame in audio_frames:
+                # Process received audio (send to model)
                 _monitor_queue_size(self.audio_queue, "audio_queue")
                 await self.connection.send_audio_data(audio_frame.data)
-                
-                # 写入 PCM 数据
+
+                # Write PCM data if enabled
                 await pcm_writer.write(audio_frame.data)
-                
-                # 让出控制权以允许其他任务运行
-                await asyncio.sleep(0)
-            
+
+                await asyncio.sleep(0)  # Yield control to allow other tasks to run
+
         except asyncio.CancelledError:
             # Write any remaining PCM data before exiting
             await pcm_writer.flush()

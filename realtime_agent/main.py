@@ -17,7 +17,8 @@ from realtime_agent.realtime.agent_functions import AgentToolsMetaWorkplaces,t2i
 from .realtime.struct import PCM_CHANNELS, PCM_SAMPLE_RATE, ServerVADUpdateParams, SemanticVADUpdateParams,Voices
 
 from .agent import InferenceConfig, RealtimeKitAgent
-from agora_realtime_ai_api.rtc import RtcEngine, RtcOptions
+from agora_realtime_ai_api.rtc import RtcOptions
+from .agora_mixed.rtc_mixed import MixedRtcEngine
 from .logger import setup_logger
 from .parse_args import parse_args, parse_args_realtimekit
 
@@ -92,7 +93,7 @@ def run_agent_in_process(
     global agent_tools
     asyncio.run(
         RealtimeKitAgent.setup_and_run_agent(
-            engine=RtcEngine(appid=engine_app_id, appcert=engine_app_cert),
+            engine=MixedRtcEngine(appid=engine_app_id, appcert=engine_app_cert),
             options=RtcOptions(
                 channel_name=channel_name,
                 uid=uid,

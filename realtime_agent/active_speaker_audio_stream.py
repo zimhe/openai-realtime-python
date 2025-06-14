@@ -109,21 +109,46 @@ class ActiveSpeakerAudioStream:
         if not avg_rms_scores:
             return
 
+        selected_speaker = None
+
         # 若只有一个用户，直接选取
         if len(avg_rms_scores) == 1:
             selected_speaker = next(iter(avg_rms_scores))
         else:
-            # softmax 归一化为概率分布
             user_ids = list(avg_rms_scores.keys())
-            rms_values = np.array([avg_rms_scores[uid] for uid in user_ids], dtype=np.float32)
-            exp_values = np.exp(rms_values / self.SOFT_SELECTION_TEMPERATURE)
-            probs = exp_values / np.sum(exp_values)
+            rms_raw = np.array([avg_rms_scores[uid] for uid in user_ids], dtype=np.float32)
+            rms_total = np.sum(rms_raw)
+            if rms_total == 0:
+                logger.warning("Total RMS is zero; skipping active speaker update.")
+                return
+            rms_values = rms_raw / rms_total  # 归一化 RMS，避免数值过大
+
+            if not np.all(np.isfinite(rms_values)):
+                logger.warning(f"Invalid RMS values detected: {rms_values}")
+                return
+
+            
+            shifted = rms_values / self.SOFT_SELECTION_TEMPERATURE
+            exp_values = np.exp(shifted)
+            total = np.sum(exp_values)
+
+            if not np.isfinite(total) or total <= 0:
+                logger.warning(f"Invalid softmax denominator: {total}")
+                return
+
+            # 将反比概率翻转为正比，越大 RMS 越大概率
+            probs = exp_values / total
+            
             selected_speaker = random.choices(user_ids, weights=probs, k=1)[0]
+
+        # 若选说话人失败则跳过
+        if selected_speaker is None:
+            return
 
         # 若与当前活跃者不同，判断是否可切换
         if self.active_speaker_id != selected_speaker:
-            if now - self.last_switch_time < self.SPEAKER_LOCK_DURATION:
-                return  # 锁定期中，忽略切换
+            # if now - self.last_switch_time < self.SPEAKER_LOCK_DURATION:
+            #     return  # 锁定期中，忽略切换
 
             # 判断是否持续主导发声
             dominant_duration = sum(
