@@ -138,31 +138,29 @@ class MixedChannelEventObserver(
         return 0
 
     def on_mixed_audio_frame(self, agora_local_user, channelId, frame):
-        audio_frame = PcmAudioFrame()
-        audio_frame.samples_per_channel = frame.samples_per_channel
-        audio_frame.bytes_per_sample = frame.bytes_per_sample
-        audio_frame.number_of_channels = frame.channels
-        audio_frame.sample_rate = self.options.sample_rate
-        audio_frame.data = frame.buffer
-
-        # print(
-        #     "on_playback_audio_frame",
-        #     audio_frame.samples_per_channel,
-        #     audio_frame.bytes_per_sample,
-        #     audio_frame.number_of_channels,
-        #     audio_frame.sample_rate,
-        #     len(audio_frame.data),
-        # )
         
-        self.loop.call_soon_threadsafe(
-            self.mixed_audio_stream.queue.put_nowait, audio_frame
-        )
+        try:
+            audio_frame = PcmAudioFrame()
+            audio_frame.samples_per_channel = frame.samples_per_channel
+            audio_frame.bytes_per_sample = frame.bytes_per_sample
+            audio_frame.number_of_channels = frame.channels
+            audio_frame.sample_rate = self.options.sample_rate
+            audio_frame.data = frame.buffer
+            
+            self.loop.call_soon_threadsafe(
+                self.mixed_audio_stream.queue.put_nowait, audio_frame
+            )
+              
+        except Exception as e:
+            logger.error(f"Error processing mixed audio frame: {e}")
+            return 1
+
         return 0
         
-    def on_active_speaker(self, agora_local_user, userId):
-        self.active_speaker = userId
-        logger.info(f"Active speaker changed: {userId}")
-        #return super().on_active_speaker(agora_local_user, userId)
+    # def on_active_speaker(self, agora_local_user, userId):
+    #     self.active_speaker = userId
+    #     logger.info(f"Active speaker changed: {userId}")
+    #     #return super().on_active_speaker(agora_local_user, userId)
 
 class MixedChannel(Channel):
     def __init__(self, rtc: "RtcEngine", options: RtcOptions) -> None:
@@ -199,7 +197,7 @@ class MixedChannel(Channel):
         self.local_user.set_mixed_audio_frame_parameters(
             options.channels, options.sample_rate,1024
         )
-        self.local_user.set_audio_volume_indication_parameters(200,5,True)
+        #self.local_user.set_audio_volume_indication_parameters(200,5,True)
         self.local_user.register_local_user_observer(self.channel_event_observer)
         self.local_user.register_audio_frame_observer(self.channel_event_observer, self.options.enable_vad, self.options.vad_configs)
         # self.local_user.subscribe_all_audio()
