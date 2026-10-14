@@ -60,6 +60,13 @@ Before running the demo, ensure you have the following installed and configured:
    ```bash
    pip install -r requirements.txt
    ```
+1. If you are using the Volcengine provider, configure the context-related environment variables in `.env`:
+  ```env
+  VOLCENGINE_DIALOG_ID=your-stable-dialog-id
+  ARK_API_KEY=your-ark-api-key
+  VOLCENGINE_FUNCTION_CALL_MODEL=doubao-seed-2-0-lite-260215
+  ```
+  Reuse the same `VOLCENGINE_DIALOG_ID` for the same user or conversation when you want Doubao to load recent history across sessions.
 1. Run the demo agent:
    ```bash
    python -m realtime_agent.main agent --channel_name=<channel_name> --uid=<agent_uid>
@@ -121,3 +128,34 @@ curl 'http://localhost:8080/stop_agent' \
 ### Front-End for Testing
 
 To test agents, use Agora's [Voice Call Demo](https://webdemo.agora.io/basicVoiceCall/index.html).
+# Office lobby directory
+
+This always-on HTTP service can also list live Unity Office dedicated servers.
+It only stores routing metadata; Unity gameplay still runs on the dedicated
+server and clients connect directly to its advertised UDP address and port.
+
+Set `OFFICE_DIRECTORY_KEY` to a long random secret in this service's environment
+and in each dedicated server's environment. Do not put it in a Unity client
+build or commit it to a batch file. The directory endpoints are:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/offices` | Public list of live offices, returned as `{"offices":[...]}`. |
+| `POST` | `/offices/heartbeat` | Register or refresh an office. Requires `Authorization: Bearer <OFFICE_DIRECTORY_KEY>`. |
+| `DELETE` | `/offices/{instanceId}` | Remove an office on orderly shutdown. Requires the same credential. |
+
+Heartbeat entries expire after 75 seconds. Unity dedicated servers refresh
+every 25 seconds and register only after their environment scene is ready. A
+service restart temporarily empties the in-memory list until the next heartbeat.
+Run one HTTP instance for this initial setup; a future multi-instance deployment
+needs a shared TTL store such as Redis. The `instanceId` uniquely identifies a
+server process, while `lobbyId` identifies its whitelisted Unity scene. Multiple
+processes may advertise the same scene.
+
+The server sends `lobbyId`, `instanceId`, `displayName`, `address`, `port`,
+`scope` (`local` or `public`), `sceneName`, `buildVersion`, `maxPlayers`,
+`currentPlayers`, and an optional `previewImageUrl`. Preview images must be
+public HTTPS URLs. The Unity client can also use its existing local catalog
+image when the directory entry has the same lobby ID. An advertised `local`
+address is only reachable by clients on that LAN; public deployment must use a
+publicly reachable host and open the Unity Transport UDP port.

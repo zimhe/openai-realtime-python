@@ -1,4 +1,5 @@
 import asyncio
+from array import array
 import functools
 from datetime import datetime
 
@@ -13,6 +14,52 @@ def generate_file_name(prefix: str) -> str:
     # Create a timestamp for the file name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"{prefix}_{timestamp}.pcm"
+
+
+def resample_pcm16(audio_data: bytes, source_rate: int, target_rate: int) -> bytes:
+    if not audio_data or source_rate == target_rate:
+        return audio_data
+
+    source = array("h")
+    source.frombytes(audio_data)
+    if not source:
+        return b""
+
+    target_length = max(1, int(round(len(source) * target_rate / source_rate)))
+    if len(source) == 1:
+        repeated = array("h", [source[0]] * target_length)
+        return repeated.tobytes()
+
+    step = (len(source) - 1) / max(1, target_length - 1)
+    target = array("h")
+    for index in range(target_length):
+        position = index * step
+        left_index = int(position)
+        right_index = min(left_index + 1, len(source) - 1)
+        ratio = position - left_index
+        value = int(source[left_index] * (1.0 - ratio) + source[right_index] * ratio)
+        target.append(max(-32768, min(32767, value)))
+
+    return target.tobytes()
+
+
+class PCMChunker:
+    def __init__(self, chunk_size: int):
+        self.chunk_size = chunk_size
+        self.buffer = bytearray()
+
+    def push(self, data: bytes) -> list[bytes]:
+        if data:
+            self.buffer.extend(data)
+
+        chunks: list[bytes] = []
+        while len(self.buffer) >= self.chunk_size:
+            chunks.append(bytes(self.buffer[: self.chunk_size]))
+            del self.buffer[: self.chunk_size]
+        return chunks
+
+    def clear(self) -> None:
+        self.buffer.clear()
 
 
 class PCMWriter:
