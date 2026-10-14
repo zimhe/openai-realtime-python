@@ -13,7 +13,7 @@ from ..logger import setup_logger
 logger = setup_logger(name=__name__, log_level=logging.INFO)
 
 
-DEFAULT_VIRTUAL_MODEL = "gpt-4o-realtime-preview"
+DEFAULT_VIRTUAL_MODEL = "gpt-realtime-2"
 
 def smart_str(s: str, max_field_len: int = 128) -> str:
     """parse string as json, truncate data field to 128 characters, reserialize"""
@@ -61,13 +61,16 @@ class RealtimeApiConnection:
         return False
 
     async def connect(self):
-        auth = aiohttp.BasicAuth("", self.api_key) if self.api_key else None
+        headers: dict[str, str] = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
 
-        headers = {"OpenAI-Beta": "realtime=v1"}
+        safety_identifier = os.environ.get("OPENAI_SAFETY_IDENTIFIER")
+        if safety_identifier:
+            headers["OpenAI-Safety-Identifier"] = safety_identifier
 
         self.websocket = await self.session.ws_connect(
             url=self.url,
-            auth=auth,
             headers=headers,
         )
 
@@ -87,11 +90,18 @@ class RealtimeApiConnection:
         await self.send_request(message)
 
     async def send_request(self, message: ClientToServerMessage):
-        assert self.websocket is not None
+        if self.websocket is None:
+            raise ConnectionError("Realtime websocket is not connected")
+        if self.websocket.closed:
+            raise ConnectionError("Realtime websocket is closed")
+
         message_str = to_json(message)
         if self.verbose:
             logger.info(f"-> {smart_str(message_str)}")
-        await self.websocket.send_str(message_str)
+        try:
+            await self.websocket.send_str(message_str)
+        except aiohttp.ClientConnectionError as exc:
+            raise ConnectionError("Realtime websocket transport is closing") from exc
 
     
 
@@ -123,3 +133,5 @@ class RealtimeApiConnection:
         if self.websocket:
             await self.websocket.close()
             self.websocket = None
+        if not self.session.closed:
+            await self.session.close()

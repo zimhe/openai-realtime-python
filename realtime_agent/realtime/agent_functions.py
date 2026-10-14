@@ -1,27 +1,33 @@
 from typing import Any
+from datetime import datetime, timezone
+from urllib.parse import quote, urlparse
+import hashlib
+import hmac
 
-import replicate.prediction
 from realtime_agent.tools import ToolContext
 
 from agora_realtime_ai_api.rtc import Channel, ChatMessage, RtcEngine, RtcOptions
 from .struct import to_json
 from ..utils import PCMWriter
 import asyncio
-import replicate
 import uuid
 import json
 import aiohttp
 import os
 from openai import OpenAI
 
-# Function calling Example
-# This is an example of how to add a new function to the agent tools.
-
-t2i_api="black-forest-labs/flux-kontext-pro"
-t2i_condition_api="black-forest-labs/flux-depth-pro"
-t2i_image_mask_api="black-forest-labs/flux-fill-pro"
 aliyun_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
 aliyun_model_id="qwen2.5-vl-7b-instruct"
+ark_image_url = os.environ.get("ARK_IMAGE_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
+ark_image_model_id = os.environ.get("ARK_IMAGE_MODEL_ID", "doubao-seedream-5-0-lite-260128")
+ark_image_size = os.environ.get("ARK_IMAGE_SIZE", "2K")
+ark_api_key = os.environ.get("ARK_API_KEY")
+visual_base_url = os.environ.get("VOLCENGINE_VISUAL_BASE_URL", "https://visual.volcengineapi.com")
+visual_region = os.environ.get("VOLCENGINE_VISUAL_REGION", "cn-north-1")
+visual_service = os.environ.get("VOLCENGINE_VISUAL_SERVICE", "cv")
+visual_submit_action = "CVSync2AsyncSubmitTask"
+visual_get_result_action = "CVSync2AsyncGetResult"
+visual_api_version = "2022-08-31"
 
 T2I_OUTPUT="text2image.output"
 
@@ -125,18 +131,6 @@ class AgentToolsMetaWorkplaces(ToolContext):
         )
         
         self.register_function(
-            name="get_web_search_results",
-            description="perform an online search for relevant information based on given query keywords, can be used when ever the user querys something that is not in the local knowledge base, the function will return a json object with the search results",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The search query string."},
-                },
-            },
-            fn=self._get_web_search_results,
-        )
-        
-        self.register_function(
             name="get_history_image_info",
             description="get the history images info with json format, can be used to when user queries the previous generation records, the function will return a json object with the history images info, including the message id, the prompt and image url",
             parameters={
@@ -144,26 +138,6 @@ class AgentToolsMetaWorkplaces(ToolContext):
                 "properties": {},
             },
             fn=self._get_history_images_data,
-        )
-        
-        self.register_function(
-            name="interpert_image",
-            description="interpert the image with given query, the image url should be a valid url",
-            parameters={
-                "type":"object",
-                "properties":{
-                    "image_url":{
-                        "type":"string",
-                        "description":"the image url that needs to be interpreted"
-                    },
-                    "query":{
-                        "type":"string",
-                        "description":"the query that needs to be interpreted"
-                    }
-                },
-                "required":["image_url","query"]
-            },
-            fn=self._interpert_image,
         )
         
         self.register_function(
@@ -215,9 +189,9 @@ class AgentToolsMetaWorkplaces(ToolContext):
 
     async def _text2image(self,prompt:str,screen_id:int=-1) -> dict[str, Any]:
         try:
-            input = { "prompt": prompt,"output_format":"png","aspect_ratio":"16:9" }
-            
-            output=await replicate.async_run(t2i_api,input,use_file_output=False)
+            output = await self._generate_seedream_image(prompt=prompt)
+            if not output:
+                raise RuntimeError("Seedream did not return an image URL")
             
             screen_key=None
             proper_screen_id=screen_id-1
@@ -226,9 +200,6 @@ class AgentToolsMetaWorkplaces(ToolContext):
                 screen_key="selected"
             elif screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
                 screen_key=self.screen_keys[proper_screen_id]
-            
-            if isinstance(output, list):
-                output=output[0]  # Ensure we get the first image if multiple are returned
             
             msg_id=uuid.uuid4().hex
             
@@ -242,8 +213,8 @@ class AgentToolsMetaWorkplaces(ToolContext):
             
             return {
                 "status": "success",
-                "message": f"text to image success, the result is {output[0]}",
-                "result": output[0],
+                "message": f"text to image success, the result is {output}",
+                "result": output,
             }
         except Exception as e:
             return {
@@ -255,17 +226,9 @@ class AgentToolsMetaWorkplaces(ToolContext):
 
     async def _refine_this_image(self,prompt: str,input_image:str,screen_id:int=-1) -> dict[str, Any]:
         try:
-            input = { 
-                     "prompt": prompt,
-                     "aspect_ratio":"match_input_image",
-                     "output_format":"png",
-                     "input_image":input_image
-                     }
-            
-            output=await replicate.async_run(t2i_api,input,use_file_output=False)
-            
-            if isinstance(output, list):
-                output=output[0]  # Ensure we get the first image if multiple are returned
+            output = await self._generate_seedream_image(prompt=prompt, image=input_image)
+            if not output:
+                raise RuntimeError("Seedream did not return an image URL")
             
 
             screen_key=None
@@ -289,54 +252,42 @@ class AgentToolsMetaWorkplaces(ToolContext):
             return {
                 "status": "success",
                 "message": f"text to image success, the result is {output}",
-                "result": output[0],
+                "result": output,
             }
         except Exception as e:
             return {
                 "status": "error",
                 "message": f"Failed to get : {str(e)}",
             }
-            
-            
+
     async def _refine_image_with_mask(self,prompt:str,image_url:str,mask_url:str,screen_id:int=-1)-> dict[str, Any]:
         try:
+            output = await self._generate_visual_inpaint_image(
+                prompt=prompt,
+                image_url=image_url,
+                mask_url=mask_url,
+            )
+            if not output:
+                raise RuntimeError("Volcengine visual inpaint did not return an image URL")
 
-            input={
-                    "mask": mask_url,
-                    "image": image_url,
-                    "steps": 30,
-                    "prompt": prompt,
-                    "guidance": 60,
-                    "outpaint": "None",
-                    "output_format": "png",
-                    "safety_tolerance": 2,
-                    "prompt_upsampling": False
-                }
-            
-            output=await replicate.async_run(t2i_image_mask_api,input,use_file_output=False)
-            
             screen_key=None
             proper_screen_id=screen_id-1
-            
+
             if screen_id==-2:
                 screen_key="selected"
             elif screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
                 screen_key=self.screen_keys[proper_screen_id]
-            
-            
-            if isinstance(output, list):
-                output=output[0]  # Ensure we get the first image if multiple are returned
-            
+
             msg_id=uuid.uuid4().hex
-            
+
             result=self.format_t2i_result(output,screen_key,msg_id)
-            
+
             chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
-            
+
             self.append_history_image(msg_id,prompt,output)
-            
+
             await self.channel.chat.send_message(chat_message)
-            
+
             return {
                 "status": "success",
                 "message": f"refine image success, the result is {output}",
@@ -347,6 +298,228 @@ class AgentToolsMetaWorkplaces(ToolContext):
                 "status": "error",
                 "message": f"Failed to get : {str(e)}",
             }
+
+    async def _generate_seedream_image(self, *, prompt: str, image: str | None = None) -> str | None:
+        if not ark_api_key:
+            raise RuntimeError("ARK_API_KEY must be set for Seedream image generation")
+
+        client = OpenAI(api_key=ark_api_key, base_url=ark_image_url)
+        extra_body: dict[str, Any] = {
+            "sequential_image_generation": "disabled",
+            "watermark": False,
+        }
+        if image:
+            extra_body["image"] = image
+
+        response = await asyncio.to_thread(
+            client.images.generate,
+            model=ark_image_model_id,
+            prompt=prompt,
+            size=ark_image_size,
+            response_format="url",
+            extra_body=extra_body,
+        )
+
+        generated = getattr(response, "data", None) or []
+        for item in generated:
+            url = getattr(item, "url", None)
+            if url:
+                return url
+        return None
+
+    async def _generate_visual_inpaint_image(self, *, prompt: str, image_url: str, mask_url: str) -> str | None:
+        task_payload = {
+            "req_key": "i2i_inpainting_edit",
+            "image_urls": [image_url, mask_url],
+            "custom_prompt": prompt,
+            "steps": int(os.environ.get("VOLCENGINE_VISUAL_INPAINT_STEPS", "25")),
+            "scale": float(os.environ.get("VOLCENGINE_VISUAL_INPAINT_SCALE", "5")),
+            "seed": int(os.environ.get("VOLCENGINE_VISUAL_INPAINT_SEED", "-1")),
+        }
+        submit_response = await self._visual_signed_post(visual_submit_action, task_payload)
+        if not self._is_visual_success_code(submit_response.get("code")):
+            raise RuntimeError(submit_response.get("message") or "Volcengine visual inpaint submit failed")
+
+        task_id = str((submit_response.get("data") or {}).get("task_id") or "").strip()
+        if not task_id:
+            raise RuntimeError("Volcengine visual inpaint submit did not return task_id")
+
+        max_attempts = int(os.environ.get("VOLCENGINE_VISUAL_INPAINT_MAX_ATTEMPTS", "30"))
+        poll_interval_seconds = float(os.environ.get("VOLCENGINE_VISUAL_INPAINT_POLL_SECONDS", "2"))
+
+        for attempt in range(max_attempts):
+            result_response = await self._visual_signed_post(
+                visual_get_result_action,
+                {"task_id": task_id},
+            )
+            if not self._is_visual_success_code(result_response.get("code")):
+                raise RuntimeError(result_response.get("message") or "Volcengine visual inpaint polling failed")
+
+            data = result_response.get("data") or {}
+            extracted_url = self._extract_first_image_url(data)
+            if extracted_url:
+                return extracted_url
+
+            status = str(
+                data.get("status")
+                or data.get("task_status")
+                or data.get("state")
+                or data.get("phase")
+                or ""
+            ).strip().lower()
+
+            if status in {"failed", "error", "timeout", "canceled", "cancelled"}:
+                raise RuntimeError(data.get("message") or data.get("error") or f"Volcengine visual inpaint task failed: {status}")
+
+            if attempt == max_attempts - 1:
+                break
+
+            await asyncio.sleep(poll_interval_seconds)
+
+        raise RuntimeError("Volcengine visual inpaint task did not finish before timeout")
+
+    async def _visual_signed_post(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        access_key_id, secret_access_key, security_token = self._get_visual_credentials()
+
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        content_sha256 = hashlib.sha256(body).hexdigest()
+
+        endpoint = urlparse(visual_base_url)
+        host = endpoint.netloc
+        path = endpoint.path or "/"
+        timestamp = datetime.now(timezone.utc)
+        x_date = timestamp.strftime("%Y%m%dT%H%M%SZ")
+        short_date = x_date[:8]
+
+        query = {
+            "Action": action,
+            "Version": visual_api_version,
+        }
+        canonical_query = "&".join(
+            f"{quote(key, safe='-_.~')}={quote(value, safe='-_.~')}"
+            for key, value in sorted(query.items())
+        )
+        signed_headers = "content-type;host;x-content-sha256;x-date"
+        canonical_headers = (
+            f"content-type:application/json\n"
+            f"host:{host}\n"
+            f"x-content-sha256:{content_sha256}\n"
+            f"x-date:{x_date}\n"
+        )
+        canonical_request = (
+            f"POST\n"
+            f"{path}\n"
+            f"{canonical_query}\n"
+            f"{canonical_headers}\n"
+            f"{signed_headers}\n"
+            f"{content_sha256}"
+        )
+        credential_scope = f"{short_date}/{visual_region}/{visual_service}/request"
+        string_to_sign = (
+            f"HMAC-SHA256\n"
+            f"{x_date}\n"
+            f"{credential_scope}\n"
+            f"{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+        )
+
+        signing_key = self._sign_hmac(
+            self._sign_hmac(
+                self._sign_hmac(
+                    self._sign_hmac(secret_access_key.encode("utf-8"), short_date),
+                    visual_region,
+                ),
+                visual_service,
+            ),
+            "request",
+        )
+        signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+        headers = {
+            "Content-Type": "application/json",
+            "Host": host,
+            "X-Date": x_date,
+            "X-Content-Sha256": content_sha256,
+            "Authorization": (
+                f"HMAC-SHA256 Credential={access_key_id}/{credential_scope}, "
+                f"SignedHeaders={signed_headers}, Signature={signature}"
+            ),
+        }
+        if security_token:
+            headers["X-Security-Token"] = security_token
+
+        request_url = f"{visual_base_url}?{canonical_query}"
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                request_url,
+                data=body,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as response:
+                response.raise_for_status()
+                return await response.json()
+
+    def _get_visual_credentials(self) -> tuple[str, str, str | None]:
+        access_key_id = (
+            os.environ.get("VOLCENGINE_VISUAL_ACCESS_KEY_ID")
+            or os.environ.get("VOLCENGINE_ACCESS_KEY_ID")
+            or ""
+        ).strip()
+        secret_access_key = (
+            os.environ.get("VOLCENGINE_VISUAL_SECRET_ACCESS_KEY")
+            or os.environ.get("VOLCENGINE_SECRET_ACCESS_KEY")
+            or ""
+        ).strip()
+        security_token = (
+            os.environ.get("VOLCENGINE_VISUAL_SESSION_TOKEN")
+            or os.environ.get("VOLCENGINE_SESSION_TOKEN")
+            or None
+        )
+
+        if not access_key_id or not secret_access_key:
+            raise RuntimeError(
+                "VOLCENGINE_VISUAL_ACCESS_KEY_ID and VOLCENGINE_VISUAL_SECRET_ACCESS_KEY must be set for visual inpaint"
+            )
+
+        return access_key_id, secret_access_key, security_token
+
+    def _sign_hmac(self, key: bytes, message: str) -> bytes:
+        return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
+
+    def _is_visual_success_code(self, code: Any) -> bool:
+        return str(code).strip() == "10000"
+
+    def _extract_first_image_url(self, data: Any) -> str | None:
+        if isinstance(data, dict):
+            direct_url = data.get("url") or data.get("image_url")
+            if isinstance(direct_url, str) and direct_url:
+                return direct_url
+
+            image_urls = data.get("image_urls") or data.get("urls") or data.get("result")
+            if isinstance(image_urls, list):
+                for item in image_urls:
+                    extracted = self._extract_first_image_url(item)
+                    if extracted:
+                        return extracted
+            elif isinstance(image_urls, str) and image_urls:
+                return image_urls
+
+            for value in data.values():
+                extracted = self._extract_first_image_url(value)
+                if extracted:
+                    return extracted
+            return None
+
+        if isinstance(data, list):
+            for item in data:
+                extracted = self._extract_first_image_url(item)
+                if extracted:
+                    return extracted
+            return None
+
+        if isinstance(data, str) and data.startswith(("http://", "https://")):
+            return data
+
+        return None
     
             
     async def _get_history_images_data(self)-> dict[str, Any]:

@@ -101,6 +101,7 @@ class Session:
 
 @dataclass
 class SessionUpdateParams:
+    type: Optional[str] = None  # GA Realtime sessions should declare the realtime session type.
     model: Optional[str] = None  # Optional string to specify the model
     modalities: Optional[Set[str]] = None  # Set of allowed modalities (e.g., "text", "audio")
     instructions: Optional[str] = None  # Optional instructions string
@@ -453,6 +454,12 @@ class RateLimitsUpdated(ServerToClientMessage):
 
 
 @dataclass
+class UnknownServerEvent(ServerToClientMessage):
+    type: str
+    payload: Dict[str, Any]
+
+
+@dataclass
 class ResponseOutputItemAdded(ServerToClientMessage):
     response_id: str  # The ID of the response
     output_index: int  # Index of the output item in the response
@@ -532,6 +539,7 @@ ServerToClientMessages = Union[
     ResponseContentPartAdded,
     ResponseContentPartDone,
     ResponseOutputItemDone,
+    ItemInputAudioTranscriptionDelta,
     ItemInputAudioTranscriptionCompleted,
     ItemInputAudioTranscriptionFailed
 ]
@@ -687,6 +695,18 @@ def parse_client_message(unparsed_string: str) -> ClientToServerMessage:
 
 def parse_server_message(unparsed_string: str) -> ServerToClientMessage:
     data = json.loads(unparsed_string)
+    event_type_aliases = {
+        "response.output_text.delta": EventType.RESPONSE_TEXT_DELTA,
+        "response.output_text.done": EventType.RESPONSE_TEXT_DONE,
+        "response.output_audio.delta": EventType.RESPONSE_AUDIO_DELTA,
+        "response.output_audio.done": EventType.RESPONSE_AUDIO_DONE,
+        "response.output_audio_transcript.delta": EventType.RESPONSE_AUDIO_TRANSCRIPT_DELTA,
+        "response.output_audio_transcript.done": EventType.RESPONSE_AUDIO_TRANSCRIPT_DONE,
+        "conversation.item.added": EventType.ITEM_CREATED,
+        "conversation.item.done": EventType.ITEM_CREATED,
+    }
+    if data.get("type") in event_type_aliases:
+        data["type"] = event_type_aliases[data["type"]]
 
     # Dynamically select the correct message class based on the `type` field, using from_dict
     if data["type"] == EventType.ERROR:
@@ -746,7 +766,11 @@ def parse_server_message(unparsed_string: str) -> ServerToClientMessage:
     elif data["type"] == EventType.ITEM_INPUT_AUDIO_TRANSCRIPTION_FAILED:
         return from_dict(ItemInputAudioTranscriptionFailed, data)
 
-    raise ValueError(f"Unknown message type: {data['type']}")
+    return UnknownServerEvent(
+        event_id=data.get("event_id", ""),
+        type=data["type"],
+        payload=data,
+    )
     
 def to_json(obj: Union[ClientToServerMessage, ServerToClientMessage]) -> str:
     return json.dumps(asdict(obj))
