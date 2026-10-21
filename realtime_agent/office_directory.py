@@ -56,6 +56,7 @@ def _validate_office(data):
     if not _LOBBY_ID.fullmatch(lobby_id):
         raise ValueError("invalid lobbyId")
     instance_id = _string(data.get("instanceId"), "instanceId", 80)
+    slot_id = _string(data.get("slotId", ""), "slotId", 80, False)
     port = data.get("port")
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
@@ -78,6 +79,7 @@ def _validate_office(data):
     return {
         "lobbyId": lobby_id,
         "instanceId": instance_id,
+        "slotId": slot_id,
         "displayName": _string(data.get("displayName"), "displayName", 100),
         "address": _validate_host(data.get("address")),
         "port": port,
@@ -123,6 +125,13 @@ async def heartbeat_office(request):
     except (ValueError, TypeError) as exc:
         return web.json_response({"error": str(exc)}, status=400)
     registry = _live_entries(request.app[REGISTRY_KEY])
+    # A restarted process takes over its stable slot immediately. Keep process
+    # IDs distinct so a late DELETE from the old process cannot remove it.
+    if office["slotId"]:
+        for instance_id, record in list(registry.items()):
+            if (instance_id != office["instanceId"]
+                    and record["office"].get("slotId") == office["slotId"]):
+                del registry[instance_id]
     registry[office["instanceId"]] = {
         "office": office,
         "expiresAt": time.monotonic() + _TTL_SECONDS,

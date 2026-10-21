@@ -25,6 +25,14 @@ jobs:
         with:
           fetch-tags: true
           fetch-depth: "0"
+      - name: Set up Go for token service checks
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: token_service/go.mod
+          cache-dependency-path: token_service/go.sum
+      - name: Test bundled token service
+        working-directory: token_service
+        run: go test ./...
       - id: pre-step
         shell: bash
         run: echo "image-tag=$(git describe --tags --always)" >> $GITHUB_OUTPUT

@@ -1,3 +1,11 @@
+FROM golang:1.23-bookworm AS token-builder
+
+WORKDIR /src
+COPY token_service/go.mod token_service/go.sum ./
+RUN go mod download
+COPY token_service/ ./
+RUN CGO_ENABLED=0 go build -o /out/agora-token-service ./cmd
+
 FROM ubuntu:22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -15,6 +23,8 @@ RUN add-apt-repository ppa:deadsnakes/ppa && \
 	rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+COPY --from=token-builder /out/agora-token-service /app/bin/agora-token-service
 
 # Copy and install Python dependencies
 COPY requirements.txt .

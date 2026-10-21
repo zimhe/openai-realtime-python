@@ -23,6 +23,7 @@ from .agora_mixed.rtc_mixed import MixedRtcEngine
 from .logger import setup_logger
 from .parse_args import parse_args, parse_args_realtimekit
 from .office_directory import install_office_directory
+from .token_service import install_token_service
 
 import openai
 
@@ -318,6 +319,7 @@ async def init_app():
     app = web.Application()
 
     install_office_directory(app)
+    install_token_service(app)
 
     # Add cleanup task to run on app exit
     app.on_cleanup.append(shutdown)
