@@ -182,8 +182,8 @@ Configure these environment variables on this service:
 
 | Variable | Purpose |
 | --- | --- |
-| `AGORA_TOKEN_APP_ID` | Copy `APP_ID` from the former token service; it must match the Unity `AgoraAppData` App ID. |
-| `AGORA_TOKEN_APP_CERT` | Copy `APP_CERTIFICATE` from the former token service; keep it server-side. |
+| `AGORA_APP_ID` | Shared Agora App ID; it must match the Unity `AgoraAppData` App ID. |
+| `AGORA_APP_CERT` | Certificate for that same Agora project; keep it server-side. |
 | `UNITY_PROJECT_ID` | Unity Authentication project ID, required for Chat token requests. |
 | `CHAT_REST_HOST` | HTTPS Agora Chat REST host for user lookup and registration. |
 
@@ -194,9 +194,9 @@ Go binary for development outside Docker. If the binary or required Agora
 credentials are missing, the other HTTP features remain available and
 `/getToken` responds with 503.
 
-The existing `AGORA_APP_ID` and `AGORA_APP_CERT` still belong to the voice
-agent. They are deliberately separate because the voice agent and Unity client
-may use different Agora projects.
+The voice agent and token endpoint use the same Agora project. If the current
+voice-service App ID has not yet been updated to the Unity project's App ID,
+update both `AGORA_APP_ID` and `AGORA_APP_CERT` together before cutover.
 
 The local Unity `AgoraAppData` token server URL has been changed to this
 service's base URL. Deploy this image and configure the variables before

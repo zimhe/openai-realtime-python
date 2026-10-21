@@ -25,10 +25,10 @@ async def _start_token_service(app):
     app[_SESSION_KEY] = ClientSession(timeout=ClientTimeout(total=45))
     app[_PROCESS_KEY] = None
 
-    app_id = os.environ.get("AGORA_TOKEN_APP_ID", "")
-    app_cert = os.environ.get("AGORA_TOKEN_APP_CERT", "")
+    app_id = os.environ.get("AGORA_APP_ID", "")
+    app_cert = os.environ.get("AGORA_APP_CERT", "")
     if not app_id or not app_cert:
-        _LOG.error("Token service disabled: AGORA_TOKEN_APP_ID and AGORA_TOKEN_APP_CERT are required")
+        _LOG.error("Token service disabled: AGORA_APP_ID and AGORA_APP_CERT are required")
         return
 
     binary = Path(os.environ.get("AGORA_TOKEN_BINARY", "/app/bin/agora-token-service"))
