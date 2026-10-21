@@ -49,6 +49,8 @@ async def _start_token_service(app):
         "APP_ID": app_id,
         "APP_CERTIFICATE": app_cert,
         "SERVER_PORT": str(port),
+        # The loopback request has no Origin, even if the parent has CORS configured.
+        "CORS_ALLOW_ORIGIN": "",
     })
     try:
         process = await asyncio.create_subprocess_exec(str(binary), env=child_env)
@@ -88,24 +90,21 @@ async def _stop_token_service(app):
         await session.close()
 
 
-async def get_token(request):
+async def _forward_token_request(request, body=None):
     process = request.app.get(_PROCESS_KEY)
     if process is None or process.returncode is not None:
         raise web.HTTPServiceUnavailable(text="Agora token service unavailable")
-    if request.content_length is not None and request.content_length > _MAX_REQUEST_BYTES:
-        raise web.HTTPRequestEntityTooLarge(
-            max_size=_MAX_REQUEST_BYTES, actual_size=request.content_length)
-    body = await request.read()
-    if len(body) > _MAX_REQUEST_BYTES:
-        raise web.HTTPRequestEntityTooLarge(
-            max_size=_MAX_REQUEST_BYTES, actual_size=len(body))
 
-    headers = {"Content-Type": request.headers.get("Content-Type", "application/json")}
+    headers = {}
+    if body is not None:
+        headers["Content-Type"] = request.headers.get("Content-Type", "application/json")
     if "Authorization" in request.headers:
         headers["Authorization"] = request.headers["Authorization"]
-    url = f"http://127.0.0.1:{request.app[_PORT_KEY]}/getToken"
+    url = f"http://127.0.0.1:{request.app[_PORT_KEY]}{request.rel_url}"
     try:
-        async with request.app[_SESSION_KEY].post(url, data=body, headers=headers) as response:
+        async with request.app[_SESSION_KEY].request(
+                request.method, url, data=body, headers=headers,
+                allow_redirects=False) as response:
             response_body = await response.read()
             return web.Response(
                 body=response_body,
@@ -120,7 +119,26 @@ async def get_token(request):
         raise web.HTTPServiceUnavailable(text="Agora token service unavailable")
 
 
+async def get_token(request):
+    if request.content_length is not None and request.content_length > _MAX_REQUEST_BYTES:
+        raise web.HTTPRequestEntityTooLarge(
+            max_size=_MAX_REQUEST_BYTES, actual_size=request.content_length)
+    body = await request.read()
+    if len(body) > _MAX_REQUEST_BYTES:
+        raise web.HTTPRequestEntityTooLarge(
+            max_size=_MAX_REQUEST_BYTES, actual_size=len(body))
+    return await _forward_token_request(request, body)
+
+
+async def get_legacy_token(request):
+    return await _forward_token_request(request)
+
+
 def install_token_service(app):
     app.on_startup.append(_start_token_service)
     app.on_cleanup.append(_stop_token_service)
     app.router.add_post("/getToken", get_token)
+    app.router.add_get("/rtc/{channelName}/{role}/{tokenType}/{rtcuid}/", get_legacy_token)
+    app.router.add_get("/rtm/{rtmuid}/", get_legacy_token)
+    app.router.add_get("/rte/{channelName}/{role}/{tokenType}/{rtcuid}/", get_legacy_token)
+    app.router.add_get("/rte/{channelName}/{role}/{tokenType}/{rtcuid}/{rtmuid}/", get_legacy_token)

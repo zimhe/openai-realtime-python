@@ -171,9 +171,10 @@ publicly reachable host and open the Unity Transport UDP port.
 ## Agora Token endpoint
 
 The Docker image builds the existing Agora Go token service from `token_service/`
-and runs it on a loopback port inside this container. This HTTP server exposes
-only `POST /getToken` and forwards requests to that local process. The request
-and response format is the same as the former standalone Agora token service,
+and runs it on a loopback port inside this container. This HTTP server forwards
+`POST /getToken` and the legacy `GET /rtc/...`, `/rtm/...`, and `/rte/...`
+routes to that local process. The request and response format is the same as
+the former standalone Agora token service,
 including RTC, RTM, and Chat token types. Chat requests still validate the
 Unity Authentication access token, then look up or register the Agora Chat
 account before returning a user token.
@@ -192,7 +193,7 @@ that port. The Go process binds to `127.0.0.1`; only the aiohttp server's
 normal HTTP port is public. `AGORA_TOKEN_BINARY` can point to a locally built
 Go binary for development outside Docker. If the binary or required Agora
 credentials are missing, the other HTTP features remain available and
-`/getToken` responds with 503.
+the token routes respond with 503.
 
 The voice agent and token endpoint use the same Agora project. If the current
 voice-service App ID has not yet been updated to the Unity project's App ID,
@@ -200,7 +201,8 @@ update both `AGORA_APP_ID` and `AGORA_APP_CERT` together before cutover.
 
 The local Unity `AgoraAppData` token server URL has been changed to this
 service's base URL. Deploy this image and configure the variables before
-rebuilding client applications. The existing Unity client sends `POST /getToken` and expects a
-JSON `token` field; no protocol change is needed. The bundled Go source is
+rebuilding client applications. Most Unity token requests use `POST /getToken`
+and expect a JSON `token` field; the Workspace screen-share path still uses the
+legacy `GET /rtc/...` format. No client protocol change is needed. The bundled Go source is
 based on the AgoraIO-Community token service and retains its MIT license in
 `token_service/LICENSE`.
