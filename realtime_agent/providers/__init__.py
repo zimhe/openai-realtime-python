@@ -7,6 +7,7 @@ from .volcengine_duplex_provider import VolcengineDuplexRealtimeProvider
 
 from .base import (
     DEFAULT_OPENAI_VOICE,
+    DEFAULT_DUPLEX_VOICE,
     DEFAULT_VOLCENGINE_VOICE,
     OPENAI_REALTIME_VOICES,
     ProviderAudioChunk,
@@ -28,6 +29,7 @@ from .base import (
 
 __all__ = [
     "DEFAULT_OPENAI_VOICE",
+    "DEFAULT_DUPLEX_VOICE",
     "DEFAULT_VOLCENGINE_VOICE",
     "ProviderAudioChunk",
     "ProviderCapabilities",
@@ -62,6 +64,8 @@ def get_default_voice(provider: ProviderName) -> str:
         return DEFAULT_OPENAI_VOICE
     if provider == "volcengine_split":
         return DEFAULT_SPLIT_TTS_VOICE
+    if provider == "volcengine_duplex":
+        return DEFAULT_DUPLEX_VOICE
     return DEFAULT_VOLCENGINE_VOICE
 
 
@@ -72,6 +76,9 @@ def normalize_provider_voice(provider: ProviderName, voice: str | None) -> str:
 
     if provider == "volcengine_split" and normalized_voice in OPENAI_REALTIME_VOICES | {DEFAULT_VOLCENGINE_VOICE}:
         return DEFAULT_SPLIT_TTS_VOICE
+
+    if provider == "volcengine_duplex" and normalized_voice in OPENAI_REALTIME_VOICES | {DEFAULT_VOLCENGINE_VOICE}:
+        return DEFAULT_DUPLEX_VOICE
 
     if provider in {"volcengine", "volcengine_split", "volcengine_duplex"} and normalized_voice in OPENAI_REALTIME_VOICES:
         return DEFAULT_VOLCENGINE_VOICE
