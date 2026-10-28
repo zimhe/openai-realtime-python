@@ -20,7 +20,7 @@ from realtime_agent.tools import ToolContext
 from realtime_agent.utils import PCMChunker, resample_pcm16
 
 from .base import (
-    DEFAULT_VOLCENGINE_VOICE,
+    DEFAULT_DUPLEX_VOICE,
     ProviderAudioChunk,
     ProviderCapabilities,
     ProviderError,
@@ -50,7 +50,7 @@ class VolcengineDuplexRealtimeProvider(RealtimeProviderConnection):
     capabilities = ProviderCapabilities(
         supports_manual_responses=False,
         supports_tools=True,
-        default_voice=DEFAULT_VOLCENGINE_VOICE,
+        default_voice=DEFAULT_DUPLEX_VOICE,
     )
 
     def __init__(self, *, verbose: bool = False):
@@ -129,14 +129,20 @@ class VolcengineDuplexRealtimeProvider(RealtimeProviderConnection):
         }
         if tools:
             session_payload["tools"] = tools.model_description()
-        extension: dict[str, Any] = {"asr": {}, "tts": {}, "dialog": {}}
+        extension: dict[str, Any] = {"asr": {}, "tts": {}, "dialog": {"extra": {"enable_music": False}}}
         search_key = os.getenv("VOLCENGINE_WEBSEARCH_API_KEY", "").strip()
         if search_key:
-            extension["dialog"]["extra"] = {
+            extension["dialog"]["extra"].update({
                 "enable_volc_websearch": True,
                 "volc_websearch_type": os.getenv("VOLCENGINE_WEBSEARCH_TYPE", "web_global_api"),
                 "volc_websearch_api_key": search_key,
-            }
+            })
+        logger.info(
+            "Duplex session config: voice=%s web_search=%s singing=disabled",
+            session_payload["audio"]["output"]["voice"], bool(search_key),
+        )
+        if not search_key:
+            logger.warning("Duplex web search is unavailable: VOLCENGINE_WEBSEARCH_API_KEY is not set")
         await self._send(
             "session.create",
             session=session_payload,
@@ -225,6 +231,12 @@ class VolcengineDuplexRealtimeProvider(RealtimeProviderConnection):
                 return
             event_type = event.get("type")
             item_id = event.get("item_id")
+            if event_type not in {
+                "conversation.item.input_audio_transcription.delta",
+                "response.output_text.delta",
+                "response.output_audio.delta",
+            }:
+                logger.info("[DuplexTrace] provider_event type=%s item_id=%s response_id=%s", event_type, item_id, event.get("response_id"))
             if event_type == "conversation.item.input_audio_transcription.started":
                 yield ProviderSpeechStarted(item_id=item_id)
             elif event_type == "conversation.item.input_audio_transcription.delta":
