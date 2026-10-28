@@ -102,6 +102,13 @@ STREAMOJI_CLIENT_ID=<Streamoji client ID>
 STREAMOJI_CLIENT_SECRET=<Streamoji client secret>
 ```
 
+The same service also relays `GET /streamoji/avatar/config`,
+`GET /streamoji/avatar/saved`, and `POST /streamoji/avatar/save`. These are
+fixed Streamoji Cloud Function targets used by the Unity avatar UI. Each
+request requires the Unity Authentication bearer, matching player ID, and the
+short-lived Streamoji token. Asset browsing, model processing, and thumbnails
+still use `glb.streamoji.com` directly.
+
 Do not put the Streamoji secret in Unity assets or client builds. The legacy
 Unity Editor-only avatar config fetch tool reads the same two Streamoji
 variables from the Editor process environment; that tool still reaches

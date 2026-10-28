@@ -7,6 +7,7 @@ server. The Unity client receives the token but never receives the secret.
 import asyncio
 import logging
 import os
+import re
 from urllib.parse import quote
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
@@ -17,6 +18,8 @@ _SESSION_KEY = web.AppKey("streamoji_auth_session", ClientSession)
 _MAX_BODY_BYTES = 4096
 _UNITY_AUTH_URL = "https://player-auth.services.api.unity.com"
 _STREAMOJI_AUTH_URL = "https://us-central1-streamoji-265f4.cloudfunctions.net/getAuthToken"
+_STREAMOJI_FUNCTION_BASE = "https://us-central1-streamoji-265f4.cloudfunctions.net"
+_AVATAR_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 async def _open_session(app: web.Application) -> None:
@@ -110,7 +113,70 @@ async def get_streamoji_auth_token(request: web.Request) -> web.Response:
     )
 
 
+async def proxy_streamoji_avatar(request: web.Request) -> web.Response:
+    """Relay only the three fixed avatar Cloud Functions, after Unity identity verification."""
+    project_id = os.getenv("UNITY_PROJECT_ID", "").strip()
+    if not project_id:
+        raise web.HTTPServiceUnavailable(text="Unity Authentication is not configured")
+    unity_token = _bearer(request)
+    player_id = request.headers.get("X-Unity-Player-Id", "").strip()
+    streamoji_token = request.headers.get("X-Streamoji-Token", "").strip()
+    if not player_id or len(player_id) > 128 or not streamoji_token or len(streamoji_token) > 4096:
+        raise web.HTTPBadRequest(text="Missing avatar relay identity or token")
+    session = request.app[_SESSION_KEY]
+    await _verify_unity_player(session, project_id, player_id, unity_token)
+
+    action = request.path.rsplit("/", 1)[-1]
+    routes = {
+        "config": ("GET", "getAvatarConfig"),
+        "saved": ("GET", "getSavedAvatarsForUser"),
+        "save": ("POST", "saveAvatarConfig"),
+    }
+    if action not in routes:
+        raise web.HTTPNotFound()
+    method, function = routes[action]
+    if request.method != method:
+        raise web.HTTPMethodNotAllowed(request.method, [method])
+    avatar_id = None
+    if action == "config":
+        avatar_id = request.query.get("avatarId", "")
+        if not _AVATAR_ID.fullmatch(avatar_id):
+            raise web.HTTPBadRequest(text="Invalid avatar ID")
+    body = None
+    if action == "save":
+        if request.content_length is not None and request.content_length > 1_000_000:
+            raise web.HTTPRequestEntityTooLarge(max_size=1_000_000, actual_size=request.content_length)
+        body = await request.read()
+        if len(body) > 1_000_000:
+            raise web.HTTPRequestEntityTooLarge(max_size=1_000_000, actual_size=len(body))
+        try:
+            import json
+            if not isinstance(json.loads(body), dict):
+                raise ValueError("Expected JSON object")
+        except (ValueError, UnicodeDecodeError):
+            raise web.HTTPBadRequest(text="Invalid avatar JSON")
+
+    url = f"{_STREAMOJI_FUNCTION_BASE}/{function}"
+    headers = {"Authorization": f"Bearer {streamoji_token}",
+               "Origin": "https://avatars.streamoji.com", "Accept": "application/json"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    try:
+        async with session.request(method, url, params={"avatarId": avatar_id} if avatar_id else None,
+                                   data=body, headers=headers, allow_redirects=False) as response:
+            result = await response.read()
+            content_type = response.headers.get("Content-Type", "application/json")
+            return web.Response(body=result, status=response.status,
+                                headers={"Cache-Control": "no-store", "Content-Type": content_type})
+    except (ClientError, asyncio.TimeoutError) as exc:
+        _LOG.warning("Streamoji avatar relay %s failed: %s", action, exc)
+        raise web.HTTPBadGateway(text="Streamoji avatar service is unavailable") from exc
+
+
 def install_streamoji_auth(app: web.Application) -> None:
     app.on_startup.append(_open_session)
     app.on_cleanup.append(_close_session)
     app.router.add_post("/streamoji/auth-token", get_streamoji_auth_token)
+    app.router.add_get("/streamoji/avatar/config", proxy_streamoji_avatar)
+    app.router.add_get("/streamoji/avatar/saved", proxy_streamoji_avatar)
+    app.router.add_post("/streamoji/avatar/save", proxy_streamoji_avatar)
