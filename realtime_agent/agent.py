@@ -250,7 +250,7 @@ class RealtimeKitAgent:
         if provider_name == "volcengine_duplex":
             search_enabled = bool(os.getenv("VOLCENGINE_WEBSEARCH_API_KEY", "").strip())
             duplex_policy = (
-                "Default to English. If a participant uses another language, reply in that language. "
+                "Speak English by default. Switch languages only when a participant explicitly asks you to. "
                 + ("Web search is enabled; use it when current information is needed. " if search_enabled else
                    "Web search is unavailable in this session; do not claim to have searched the web. ")
                 + "Do not sing or generate musical performances. "
@@ -293,6 +293,8 @@ class RealtimeKitAgent:
 
                 await agent.run()
             finally:
+                if isinstance(tools, AgentToolsMetaWorkplaces):
+                    await tools.cancel_image_tasks()
                 await channel.disconnect()
 
     def __init__(
@@ -322,6 +324,8 @@ class RealtimeKitAgent:
         self.duplex_active_uid: int | None = None
         self.duplex_awake = False
         self.duplex_active_until = 0.0
+        self.activation_state_active = False
+        self.activation_state_sequence = 0
         self.duplex_window_task: asyncio.Task[None] | None = None
         self.duplex_turn_id = 0
         self.duplex_response_started_turn: int | None = None
@@ -420,16 +424,7 @@ class RealtimeKitAgent:
                 if speaker_task is not None:
                     speaker_task.cancel()
                 if self.duplex_mode and self.duplex_active_uid == user_id:
-                    if self.duplex_turn_watchdog is not None:
-                        self.duplex_turn_watchdog.cancel()
-                        self.duplex_turn_watchdog = None
-                    self.duplex_awake = False
-                    self.duplex_active_uid = None
-                    while not self.duplex_input_queue.empty():
-                        self.duplex_input_queue.get_nowait()
-                        self.duplex_input_queue.task_done()
-                    await self.provider.mute_input()
-                    await self.provider.interrupt_response()
+                    await self._close_duplex_window("active_speaker_left")
                 if user_id in self.subscribe_users:
                     self.subscribe_users.discard(user_id)
                     logger.info(f"Subscribed user {user_id} left, removed from user list")
@@ -493,6 +488,8 @@ class RealtimeKitAgent:
                         "displayName": display_name,
                     }
                     logger.info("Bound Agora UID %s to workspace participant %s", user_id, player_id)
+                    if self.duplex_mode:
+                        await self._send_activation_state_snapshot("identity_bound")
                 return
 
             if text.startswith("workspace.screen.selection:"):
@@ -571,6 +568,38 @@ class RealtimeKitAgent:
                 msg_id=uuid.uuid4().hex,
             )
         )
+        if self.duplex_mode:
+            await self._send_activation_state_snapshot("participant_sync")
+
+    async def _send_activation_state_snapshot(self, reason: str,
+                                              active: bool | None = None,
+                                              sequence: int | None = None) -> None:
+        if active is None:
+            active = self.activation_state_active
+        if sequence is None:
+            sequence = self.activation_state_sequence
+        payload = {
+            "type": "workspace.agent.activation",
+            "state": "active" if active else "silent",
+            "sequence": sequence,
+            "reason": reason,
+        }
+        try:
+            await self.channel.chat.send_message(
+                ChatMessage(message=json.dumps(payload), msg_id=uuid.uuid4().hex)
+            )
+        except Exception:
+            logger.exception("Could not publish agent activation state")
+
+    def _set_activation_state(self, active: bool, reason: str) -> None:
+        if self.activation_state_active == active:
+            return
+        self.activation_state_active = active
+        self.activation_state_sequence += 1
+        logger.info("[DuplexTrace] activation_state=%s sequence=%s reason=%s",
+                    "active" if active else "silent", self.activation_state_sequence, reason)
+        asyncio.create_task(self._send_activation_state_snapshot(
+            reason, active, self.activation_state_sequence))
 
     def _start_speaker_task(self, uid: int) -> None:
         if uid in self.speaker_tasks and not self.speaker_tasks[uid].done():
@@ -618,6 +647,7 @@ class RealtimeKitAgent:
         if self.duplex_window_task is not None:
             self.duplex_window_task.cancel()
         self.duplex_active_until = time.monotonic() + seconds
+        self._set_activation_state(True, reason)
         logger.info("[DuplexTrace] window_open reason=%s duration_s=%.0f turn=%s", reason, seconds, self.duplex_turn_id)
         self.duplex_window_task = asyncio.create_task(self._expire_duplex_window(seconds))
 
@@ -626,6 +656,7 @@ class RealtimeKitAgent:
             await asyncio.sleep(seconds)
             if self.duplex_active_uid is None and time.monotonic() >= self.duplex_active_until:
                 self.duplex_active_until = 0.0
+                self._set_activation_state(False, "window_expired")
                 self.duplex_first_reply_pending = False
                 logger.info("[DuplexTrace] window_expired turn=%s pending_utterances=%s", self.duplex_turn_id, len(self.duplex_pending_utterances))
                 self.duplex_pending_utterances.clear()
@@ -641,6 +672,7 @@ class RealtimeKitAgent:
             self.duplex_turn_watchdog.cancel()
         self.duplex_turn_watchdog = None
         self.duplex_active_until = 0.0
+        self._set_activation_state(False, reason)
         self.duplex_response_started_turn = None
         self.duplex_first_reply_pending = False
         self.duplex_pending_utterances.clear()
@@ -1039,7 +1071,7 @@ class RealtimeKitAgent:
             )
             logger.info("[DuplexTrace] tool_started turn=%s uid=%s tool=%s watchdog_s=120", self.duplex_turn_id, tool_turn_uid, message.name)
 
-        if message.name in {"text_to_image", "refine_this_image", "refine_image_with_mask"}:
+        if message.name in {"text_to_image", "refine_this_image", "refine_masked_area_of_image"}:
             notice_id = uuid.uuid4().hex
             notice = {
                 "type": "workspace.agent.text.response",

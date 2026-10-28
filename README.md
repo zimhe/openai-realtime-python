@@ -65,6 +65,7 @@ REALTIME_PROVIDER=volcengine_duplex
 VOLCENGINE_API_KEY=<secret API key>
 ARK_API_KEY=<Ark API key for the chat/vision model and Seedream>
 ARK_CHAT_MODEL=doubao-seed-2-1-lite-260915
+ARK_TEXT_WEB_SEARCH_ENABLED=true
 VOLCENGINE_WEBSEARCH_API_KEY=<Fusion Information Search API key>
 VOLCENGINE_WEBSEARCH_TYPE=web_global_api
 VOLCENGINE_ASR_RESOURCE_ID=volc.seedasr.sauc.duration
@@ -91,6 +92,16 @@ set. Use the search service's own key, not the Ark or Duplex key. Set
 `VOLCENGINE_WEBSEARCH_TYPE` to the product enabled for that key; `web_global_api`
 is the default for full duplex. Restart or redeploy the Render service after
 changing these values.
+
+For `@agent` text search, enable **Doubao Search Custom** under the Ark
+console's component library and set `ARK_TEXT_WEB_SEARCH_ENABLED=true` on
+Render. This Chat API path uses the existing `ARK_API_KEY`; it does not use
+`VOLCENGINE_WEBSEARCH_API_KEY`. The model decides whether a text question
+needs a search, and returned source URLs are shown with the reply. Text
+requests that expose image-generation or screen tools do not use Chat API
+search in the same request because Ark gives custom tools priority over
+`web_search_options`. If the selected `ARK_CHAT_MODEL` rejects search, choose
+a model listed as supporting Doubao Search Custom in the Ark console.
 
 ### Streamoji authentication relay
 

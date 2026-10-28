@@ -14,6 +14,7 @@ import uuid
 import json
 import aiohttp
 import os
+import logging
 from contextvars import ContextVar
 from openai import OpenAI
 
@@ -29,6 +30,7 @@ visual_get_result_action = "CVSync2AsyncGetResult"
 visual_api_version = "2022-08-31"
 
 T2I_OUTPUT="text2image.output"
+logger = logging.getLogger(__name__)
 
 class AgentToolsMetaWorkplaces(ToolContext):
     def __init__(self) -> None:
@@ -40,6 +42,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
         self.selected_screen_by_uid={}
         self.request_screen_key: ContextVar[str | None] = ContextVar("request_screen_key", default=None)
         self.history_images={}
+        self.pending_image_tasks: set[asyncio.Task] = set()
         self.t2i_condition_queue=asyncio.Queue()
         
 
@@ -203,99 +206,81 @@ class AgentToolsMetaWorkplaces(ToolContext):
         self.history_images[msg_id]={"prompt": prompt, "image_url": image_url}
         
 
-    async def _text2image(self,prompt:str,screen_id:int=-1) -> dict[str, Any]:
+    async def _text2image(self, prompt: str, screen_id: int = -1) -> dict[str, Any]:
+        return self._schedule_image_job("generate", prompt, screen_id)
+
+    async def _refine_this_image(self, prompt: str, input_image: str, screen_id: int = -1) -> dict[str, Any]:
+        return self._schedule_image_job("refine", prompt, screen_id, input_image=input_image)
+
+    async def _refine_image_with_mask(self, prompt: str, image_url: str, mask_url: str,
+                                      screen_id: int = -1) -> dict[str, Any]:
+        return self._schedule_image_job("inpaint", prompt, screen_id, input_image=image_url, mask_url=mask_url)
+
+    def _schedule_image_job(self, kind: str, prompt: str, screen_id: int,
+                            input_image: str | None = None, mask_url: str | None = None) -> dict[str, Any]:
         try:
-            output = await self._generate_seedream_image(prompt=prompt)
-            if not output:
-                raise RuntimeError("Seedream did not return an image URL")
-            
-            screen_key=self.resolve_screen_key(screen_id)
-            
-            msg_id=uuid.uuid4().hex
-            
-            result=self.format_t2i_result(output,screen_key,msg_id)
-            
-            chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
-            
-            self.append_history_image(msg_id,prompt,output)
-            
-            await self.channel.chat.send_message(chat_message)
-            
+            if not prompt or not prompt.strip():
+                raise ValueError("Image prompt is empty")
+            if self.channel is None:
+                raise RuntimeError("Agent channel is not connected")
+            if kind != "inpaint" and not ark_api_key:
+                raise RuntimeError("ARK_API_KEY is required for Seedream image generation")
+            # Resolve while the request's screen selection and speaker context are still available.
+            screen_key = self.resolve_screen_key(screen_id)
+            task_id = uuid.uuid4().hex
+            task = asyncio.create_task(self._run_image_job(
+                task_id, kind, prompt, screen_key, input_image, mask_url))
+            self.pending_image_tasks.add(task)
+            task.add_done_callback(self.pending_image_tasks.discard)
+            logger.info("Image task queued: id=%s kind=%s screen=%s", task_id, kind, screen_key)
             return {
-                "status": "success",
-                "message": f"text to image success, the result is {output}",
-                "result": output,
+                "status": "queued",
+                "task_id": task_id,
+                "message": "Image generation has been scheduled. Tell the user it will appear in the conversation when ready; do not claim it is finished.",
             }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to get : {str(e)}",
-            }
-            
-            
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
 
-    async def _refine_this_image(self,prompt: str,input_image:str,screen_id:int=-1) -> dict[str, Any]:
+    async def _run_image_job(self, task_id: str, kind: str, prompt: str,
+                             screen_key: str | None, input_image: str | None,
+                             mask_url: str | None) -> None:
         try:
-            output = await self._generate_seedream_image(prompt=prompt, image=input_image)
+            if kind == "generate":
+                output = await self._generate_seedream_image(prompt=prompt)
+            elif kind == "refine":
+                output = await self._generate_seedream_image(prompt=prompt, image=input_image)
+            else:
+                output = await self._generate_visual_inpaint_image(
+                    prompt=prompt, image_url=input_image, mask_url=mask_url)
             if not output:
-                raise RuntimeError("Seedream did not return an image URL")
-            
-
-            screen_key=self.resolve_screen_key(screen_id)
-            
-            
-            msg_id=uuid.uuid4().hex
-            result=self.format_t2i_result(output,screen_key,msg_id)
-            
-            chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
-            
-            self.append_history_image(msg_id,prompt,output)
-            
-            await self.channel.chat.send_message(chat_message)
-            
-            return {
-                "status": "success",
-                "message": f"text to image success, the result is {output}",
-                "result": output,
+                raise RuntimeError("Image service returned no image URL")
+            result = self.format_t2i_result(output, screen_key, task_id)
+            await self.channel.chat.send_message(
+                ChatMessage(message=json.dumps(result), msg_id=task_id))
+            self.append_history_image(task_id, prompt, output)
+            logger.info("Image task completed: id=%s kind=%s", task_id, kind)
+        except asyncio.CancelledError:
+            logger.info("Image task cancelled: id=%s", task_id)
+            raise
+        except Exception as exc:
+            logger.exception("Image task failed: id=%s kind=%s", task_id, kind)
+            failure = {
+                "type": "workspace.agent.text.response",
+                "item_id": task_id,
+                "text": "Image generation failed. Please try again.",
             }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to get : {str(e)}",
-            }
+            try:
+                await self.channel.chat.send_message(
+                    ChatMessage(message=json.dumps(failure), msg_id=task_id))
+            except Exception:
+                logger.exception("Could not notify clients that image task %s failed", task_id)
 
-    async def _refine_image_with_mask(self,prompt:str,image_url:str,mask_url:str,screen_id:int=-1)-> dict[str, Any]:
-        try:
-            output = await self._generate_visual_inpaint_image(
-                prompt=prompt,
-                image_url=image_url,
-                mask_url=mask_url,
-            )
-            if not output:
-                raise RuntimeError("Volcengine visual inpaint did not return an image URL")
-
-            screen_key=self.resolve_screen_key(screen_id)
-
-            msg_id=uuid.uuid4().hex
-
-            result=self.format_t2i_result(output,screen_key,msg_id)
-
-            chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
-
-            self.append_history_image(msg_id,prompt,output)
-
-            await self.channel.chat.send_message(chat_message)
-
-            return {
-                "status": "success",
-                "message": f"refine image success, the result is {output}",
-                "result": output,
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to get : {str(e)}",
-            }
+    async def cancel_image_tasks(self) -> None:
+        tasks = tuple(self.pending_image_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _generate_seedream_image(self, *, prompt: str, image: str | None = None) -> str | None:
         if not ark_api_key:
