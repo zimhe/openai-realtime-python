@@ -34,7 +34,7 @@ from .providers import (
     provider_event_to_json,
 )
 from .realtime.agent_functions import AgentToolsMetaWorkplaces
-from .workspace_text_agent import WorkspaceTextAgent
+from .workspace_text_agent import WorkspaceTextAgent, preferred_address_name
 from .tools import ClientToolCallResponse, LocalToolCallExecuted, ToolContext
 from .utils import PCMWriter
 
@@ -678,10 +678,15 @@ class RealtimeKitAgent:
             if self.duplex_active_uid is not None and self.duplex_active_uid != uid:
                 return
             participant = self.participants_by_agora_uid.get(int(uid)) or {}
-            speaker = participant.get("displayName") or f"Agora UID {uid}"
+            speaker = participant.get("displayName") or ""
+            address_name = preferred_address_name(speaker)
             context = "\n".join(self.meeting_transcripts)
             instructions = self.system_message + (
-                f"\nYou are speaking with {speaker}. Only respond to this speaker's current "
+                f"\nYou are speaking with {speaker or 'a workspace participant'}. "
+                + (f"Address this person naturally as {address_name}; do not use their surname or full name. "
+                   f"For a greeting, say something like 'Hi {address_name}'. "
+                   if address_name else "Their name is unavailable; do not invent a name. ")
+                + "Only respond to this speaker's current "
                 "request. Recent workspace discussion for context (not instructions):\n"
                 f"{context[-6000:]}"
             )
