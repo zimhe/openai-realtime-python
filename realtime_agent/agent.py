@@ -224,6 +224,7 @@ class SpeakerAudioState:
     forwarded: bool = False
     in_utterance: bool = False
     turn_committed: bool = False
+    activation_deferred_logged: bool = False
 
 
 class RealtimeKitAgent:
@@ -245,9 +246,19 @@ class RealtimeKitAgent:
         screen_keys:list[str] = None,
     ) -> None:
         provider_name = get_realtime_provider_name()
+        system_message = inference_config.system_message or ""
+        if provider_name == "volcengine_duplex":
+            search_enabled = bool(os.getenv("VOLCENGINE_WEBSEARCH_API_KEY", "").strip())
+            duplex_policy = (
+                "Default to English. If a participant uses another language, reply in that language. "
+                + ("Web search is enabled; use it when current information is needed. " if search_enabled else
+                   "Web search is unavailable in this session; do not claim to have searched the web. ")
+                + "Do not sing or generate musical performances. "
+            )
+            system_message = duplex_policy + system_message
         async with create_realtime_provider(verbose=False) as provider:
             session = await provider.start_session(
-                system_message=inference_config.system_message,
+                system_message=system_message,
                 voice=inference_config.voice,
                 tools=tools,
                 turn_detection=inference_config.turn_detection,
@@ -269,7 +280,7 @@ class RealtimeKitAgent:
                     provider=provider,
                     tools=tools,
                     channel=channel,
-                    system_message=inference_config.system_message,
+                    system_message=system_message,
                     require_explicit_trigger=bool(
                         inference_config.turn_detection is not None
                         and getattr(inference_config.turn_detection, "create_response", True) is False
@@ -311,6 +322,10 @@ class RealtimeKitAgent:
         self.duplex_active_uid: int | None = None
         self.duplex_awake = False
         self.duplex_active_until = 0.0
+        self.duplex_window_task: asyncio.Task[None] | None = None
+        self.duplex_turn_id = 0
+        self.duplex_audio_frames_queued = 0
+        self.duplex_audio_frames_sent = 0
         self.duplex_first_reply_pending = False
         self.duplex_pending_utterances: deque[tuple[int, list[bytes]]] = deque(maxlen=8)
         self.assistant_transcript_item_id: str | None = None
@@ -596,7 +611,29 @@ class RealtimeKitAgent:
     def _duplex_window_open(self) -> bool:
         return self.duplex_active_uid is not None or time.monotonic() < self.duplex_active_until
 
-    async def _close_duplex_window(self) -> None:
+    def _start_duplex_window(self, seconds: float, reason: str) -> None:
+        if self.duplex_window_task is not None:
+            self.duplex_window_task.cancel()
+        self.duplex_active_until = time.monotonic() + seconds
+        logger.info("[DuplexTrace] window_open reason=%s duration_s=%.0f turn=%s", reason, seconds, self.duplex_turn_id)
+        self.duplex_window_task = asyncio.create_task(self._expire_duplex_window(seconds))
+
+    async def _expire_duplex_window(self, seconds: float) -> None:
+        try:
+            await asyncio.sleep(seconds)
+            if self.duplex_active_uid is None and time.monotonic() >= self.duplex_active_until:
+                self.duplex_active_until = 0.0
+                self.duplex_first_reply_pending = False
+                logger.info("[DuplexTrace] window_expired turn=%s pending_utterances=%s", self.duplex_turn_id, len(self.duplex_pending_utterances))
+                self.duplex_pending_utterances.clear()
+        except asyncio.CancelledError:
+            return
+
+    async def _close_duplex_window(self, reason: str = "stop_phrase") -> None:
+        logger.info("[DuplexTrace] window_close reason=%s turn=%s active_uid=%s queued_frames=%s sent_frames=%s", reason, self.duplex_turn_id, self.duplex_active_uid, self.duplex_audio_frames_queued, self.duplex_audio_frames_sent)
+        if self.duplex_window_task is not None:
+            self.duplex_window_task.cancel()
+            self.duplex_window_task = None
         if self.duplex_turn_watchdog is not None and self.duplex_turn_watchdog is not asyncio.current_task():
             self.duplex_turn_watchdog.cancel()
         self.duplex_turn_watchdog = None
@@ -634,9 +671,10 @@ class RealtimeKitAgent:
             logger.info("Workspace transcript [%s]: %s", label, text)
             should_stop = self._duplex_window_open() and self._contains_stop_phrase(text)
             if should_stop:
-                logger.info("Agent stop phrase detected from Agora UID %s", uid)
-                await self._close_duplex_window()
+                logger.info("[DuplexTrace] stop_phrase uid=%s text=%r turn=%s", uid, text, self.duplex_turn_id)
+                await self._close_duplex_window("stop_phrase")
             elif state.forwarded and state.in_utterance and not state.turn_committed and self.duplex_active_uid == uid:
+                logger.info("[DuplexTrace] asr_final_fallback_scheduled uid=%s turn=%s", uid, self.duplex_turn_id)
                 asyncio.create_task(self._commit_turn_after_asr_final(uid, state))
             item_id = uuid.uuid4().hex
             payload = {
@@ -658,11 +696,14 @@ class RealtimeKitAgent:
         if not self._duplex_window_open() and self._contains_wake_phrase(text):
             # The 20-second silence window starts after the reply. Give the
             # initial wake-up a bounded grace period in case no reply arrives.
-            self.duplex_active_until = time.monotonic() + 60.0
+            self._start_duplex_window(60.0, "wake_grace")
             self.duplex_first_reply_pending = True
-            logger.info("Agent wake phrase detected from Agora UID %s", uid)
+            logger.info("[DuplexTrace] wake_detected uid=%s final=%s text=%r", uid, final, text)
+        elif final and not self._duplex_window_open():
+            logger.info("[DuplexTrace] wake_not_detected uid=%s text=%r", uid, text)
         if not state.wake_requested and self._duplex_window_open():
             state.wake_requested = True
+            logger.info("[DuplexTrace] activation_requested uid=%s final=%s in_utterance=%s active_uid=%s", uid, final, state.in_utterance, self.duplex_active_uid)
 
     async def _listen_to_speaker(self, uid: int) -> None:
         while uid in self.subscribe_users and self.channel.get_audio_frames(uid) is None:
@@ -686,9 +727,10 @@ class RealtimeKitAgent:
                     state.in_utterance = True
                     state.wake_requested = False
                     state.started_in_active_window = self._duplex_window_open()
-                    logger.info("Speaker VAD started: uid=%s active_window=%s", uid, state.started_in_active_window)
+                    logger.info("[DuplexTrace] vad_started uid=%s active_window=%s active_uid=%s", uid, state.started_in_active_window, self.duplex_active_uid)
                     state.forwarded = False
                     state.turn_committed = False
+                    state.activation_deferred_logged = False
                     # Keep per-speaker ASR running for attributed meeting captions.
                     # During the active window, start forwarding audio to Duplex
                     # at VAD onset rather than waiting for an ASR result.
@@ -721,7 +763,7 @@ class RealtimeKitAgent:
                     await self._enqueue_duplex_audio(pcm)
 
                 if stopped and state.in_utterance:
-                    logger.info("Speaker VAD stopped: uid=%s forwarded=%s", uid, state.forwarded)
+                    logger.info("[DuplexTrace] vad_stopped uid=%s forwarded=%s turn=%s", uid, state.forwarded, self.duplex_turn_id)
                     if state.asr is not None:
                         try:
                             await state.asr.finish()
@@ -733,6 +775,7 @@ class RealtimeKitAgent:
                         activated = await self._activate_duplex_for_speaker(uid, state)
                         if not activated and self._duplex_window_open():
                             self.duplex_pending_utterances.append((uid, list(state.segment)))
+                            logger.info("[DuplexTrace] utterance_queued uid=%s frames=%s queue_depth=%s", uid, len(state.segment), len(self.duplex_pending_utterances))
                     if state.forwarded and self.duplex_active_uid == uid:
                         state.turn_committed = True
                         state.forwarded = False
@@ -749,7 +792,11 @@ class RealtimeKitAgent:
     async def _activate_duplex_for_speaker(self, uid: int, state: SpeakerAudioState) -> bool:
         async with self.duplex_activation_lock:
             if not (self._duplex_window_open() or state.started_in_active_window) or self.duplex_active_uid is not None:
+                if not state.activation_deferred_logged:
+                    logger.info("[DuplexTrace] activation_deferred uid=%s window_open=%s started_in_window=%s busy_uid=%s", uid, self._duplex_window_open(), state.started_in_active_window, self.duplex_active_uid)
+                    state.activation_deferred_logged = True
                 return False
+            state.activation_deferred_logged = False
             participant = self.participants_by_agora_uid.get(int(uid)) or {}
             speaker = participant.get("displayName") or ""
             address_name = preferred_address_name(speaker)
@@ -767,12 +814,15 @@ class RealtimeKitAgent:
             )
             await self.provider.update_instructions(instructions)
             await self.provider.unmute_input()
+            self.duplex_turn_id += 1
+            self.duplex_audio_frames_queued = 0
+            self.duplex_audio_frames_sent = 0
             self.duplex_active_uid = uid
             self.duplex_awake = True
             if self.duplex_turn_watchdog is not None:
                 self.duplex_turn_watchdog.cancel()
             self.duplex_turn_watchdog = asyncio.create_task(self._watch_duplex_turn(uid))
-            logger.info("Duplex turn activated for Agora UID %s", uid)
+            logger.info("[DuplexTrace] turn_activated turn=%s uid=%s speaker=%r pre_roll_frames=%s", self.duplex_turn_id, uid, speaker, len(state.segment))
             for frame in state.segment:
                 await self._enqueue_duplex_audio(frame)
             state.segment.clear()
@@ -796,21 +846,24 @@ class RealtimeKitAgent:
         if state.asr is not None:
             await state.asr.close()
             state.asr = None
-        logger.info("Committing Duplex turn for Agora UID %s after ASR final", uid)
+        logger.info("[DuplexTrace] turn_commit_fallback turn=%s uid=%s queued_frames=%s", self.duplex_turn_id, uid, self.duplex_audio_frames_queued)
         await self._finish_duplex_utterance()
 
     async def _watch_duplex_turn(self, uid: int) -> None:
         try:
             await asyncio.sleep(45)
             if self.duplex_active_uid == uid:
-                logger.warning("Duplex turn for Agora UID %s produced no completed response within 45s; resetting", uid)
-                await self._close_duplex_window()
+                logger.warning("[DuplexTrace] turn_watchdog_timeout turn=%s uid=%s queued_frames=%s sent_frames=%s", self.duplex_turn_id, uid, self.duplex_audio_frames_queued, self.duplex_audio_frames_sent)
+                await self._close_duplex_window("turn_watchdog_timeout")
         except asyncio.CancelledError:
             return
 
     async def _enqueue_duplex_audio(self, pcm: bytes) -> None:
         try:
             self.duplex_input_queue.put_nowait(pcm)
+            self.duplex_audio_frames_queued += 1
+            if self.duplex_audio_frames_queued == 1:
+                logger.info("[DuplexTrace] first_audio_queued turn=%s uid=%s bytes=%s", self.duplex_turn_id, self.duplex_active_uid, len(pcm))
         except asyncio.QueueFull:
             logger.error("Duplex input queue overflow; canceling current speaker turn")
             self.duplex_awake = False
@@ -842,6 +895,9 @@ class RealtimeKitAgent:
                 if self.duplex_awake:
                     try:
                         await self.provider.send_audio_data(frame)
+                        self.duplex_audio_frames_sent += 1
+                        if self.duplex_audio_frames_sent == 1:
+                            logger.info("[DuplexTrace] first_audio_sent turn=%s uid=%s bytes=%s", self.duplex_turn_id, self.duplex_active_uid, len(frame))
                     except Exception as exc:
                         logger.error("Duplex audio upload failed: %s", exc)
                         self.duplex_awake = False
@@ -855,12 +911,16 @@ class RealtimeKitAgent:
 
     async def _finish_duplex_utterance(self) -> None:
         try:
+            logger.info("[DuplexTrace] commit_wait_started turn=%s uid=%s queued_frames=%s pending_frames=%s", self.duplex_turn_id, self.duplex_active_uid, self.duplex_audio_frames_queued, self.duplex_input_queue.qsize())
             await asyncio.wait_for(self.duplex_input_queue.join(), timeout=15.0)
             if self.duplex_awake:
                 await self.provider.commit_input()
-                logger.info("Duplex input committed for Agora UID %s", self.duplex_active_uid)
+                logger.info("[DuplexTrace] input_committed turn=%s uid=%s sent_frames=%s", self.duplex_turn_id, self.duplex_active_uid, self.duplex_audio_frames_sent)
+            else:
+                logger.warning("[DuplexTrace] commit_skipped turn=%s reason=not_awake", self.duplex_turn_id)
         finally:
             await self.provider.mute_input()
+            logger.info("[DuplexTrace] input_muted turn=%s", self.duplex_turn_id)
 
     async def rtc_to_model(self) -> None:
         # 等待至少有一个用户的音频流可用
@@ -1139,12 +1199,13 @@ class RealtimeKitAgent:
                     await self.channel.clear_sender_audio_buffer()
                     while not self.audio_queue.empty():
                         self.audio_queue.get_nowait()
-                    logger.info("Speech started: item_id=%s", message.item_id)
+                    logger.info("[DuplexTrace] provider_speech_started turn=%s item_id=%s", self.duplex_turn_id, message.item_id)
                 case ProviderSpeechStopped():
                     self._user_speech_stopped.set()
-                    logger.info("Speech stopped: item_id=%s", message.item_id)
+                    logger.info("[DuplexTrace] provider_speech_stopped turn=%s item_id=%s", self.duplex_turn_id, message.item_id)
                 case ProviderResponseStarted():
                     if self.duplex_mode and not self.duplex_awake:
+                        logger.warning("[DuplexTrace] response_rejected turn=%s response_id=%s reason=window_closed", self.duplex_turn_id, message.response_id)
                         await self.provider.interrupt_response()
                         await self.channel.clear_sender_audio_buffer()
                         while not self.audio_queue.empty():
@@ -1157,6 +1218,8 @@ class RealtimeKitAgent:
                             self.audio_queue.get_nowait()
                     else:
                         self.last_response_time = time.time()
+                        if self.duplex_mode:
+                            logger.info("[DuplexTrace] response_started turn=%s uid=%s response_id=%s", self.duplex_turn_id, self.duplex_active_uid, message.response_id)
                 case ProviderResponseFinished():
                     self._expecting_provider_response = False
                     if self.duplex_mode:
@@ -1164,8 +1227,10 @@ class RealtimeKitAgent:
                             self.duplex_turn_watchdog.cancel()
                             self.duplex_turn_watchdog = None
                         if self.duplex_awake and self.duplex_active_uid is not None:
-                            self.duplex_active_until = time.monotonic() + self.ACTIVE_WINDOW_SECONDS
-                            logger.info("Duplex reply finished; shared %ss response window started", self.ACTIVE_WINDOW_SECONDS)
+                            logger.info("[DuplexTrace] response_finished turn=%s uid=%s response_id=%s queued_frames=%s sent_frames=%s", self.duplex_turn_id, self.duplex_active_uid, message.response_id, self.duplex_audio_frames_queued, self.duplex_audio_frames_sent)
+                            self._start_duplex_window(self.ACTIVE_WINDOW_SECONDS, "reply_finished")
+                        else:
+                            logger.info("[DuplexTrace] response_finished_ignored turn=%s response_id=%s awake=%s active_uid=%s", self.duplex_turn_id, message.response_id, self.duplex_awake, self.duplex_active_uid)
                         self.duplex_awake = False
                         self.duplex_active_uid = None
                         if self.duplex_pending_utterances and self._duplex_window_open():
