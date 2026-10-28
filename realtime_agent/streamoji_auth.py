@@ -11,9 +11,10 @@ import re
 from urllib.parse import quote
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
+from .logger import setup_logger
 
 
-_LOG = logging.getLogger(__name__)
+_LOG = setup_logger(name=__name__, log_level=logging.INFO)
 _SESSION_KEY = web.AppKey("streamoji_auth_session", ClientSession)
 _MAX_BODY_BYTES = 4096
 _UNITY_AUTH_URL = "https://player-auth.services.api.unity.com"
@@ -115,6 +116,8 @@ async def get_streamoji_auth_token(request: web.Request) -> web.Response:
 
 async def proxy_streamoji_avatar(request: web.Request) -> web.Response:
     """Relay only the three fixed avatar Cloud Functions, after Unity identity verification."""
+    action = request.path.rsplit("/", 1)[-1]
+    _LOG.info("Streamoji avatar relay request received: action=%s", action)
     project_id = os.getenv("UNITY_PROJECT_ID", "").strip()
     if not project_id:
         raise web.HTTPServiceUnavailable(text="Unity Authentication is not configured")
@@ -126,7 +129,6 @@ async def proxy_streamoji_avatar(request: web.Request) -> web.Response:
     session = request.app[_SESSION_KEY]
     await _verify_unity_player(session, project_id, player_id, unity_token)
 
-    action = request.path.rsplit("/", 1)[-1]
     routes = {
         "config": ("GET", "getAvatarConfig"),
         "saved": ("GET", "getSavedAvatarsForUser"),
@@ -186,6 +188,8 @@ async def proxy_streamoji_avatar(request: web.Request) -> web.Response:
             if response.status >= 400:
                 _LOG.warning("Streamoji avatar upstream returned HTTP %s for %s (avatar_id=%s)",
                              response.status, action, avatar_id or "n/a")
+            else:
+                _LOG.info("Streamoji avatar relay completed: action=%s upstream_status=%s", action, response.status)
             content_type = response.headers.get("Content-Type", "application/json")
             return web.Response(body=result, status=response.status,
                                 headers={"Cache-Control": "no-store", "Content-Type": content_type,
