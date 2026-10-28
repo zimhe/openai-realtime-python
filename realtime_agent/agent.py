@@ -308,6 +308,7 @@ class RealtimeKitAgent:
         self.meeting_transcripts: deque[str] = deque(maxlen=32)
         self.duplex_active_uid: int | None = None
         self.duplex_awake = False
+        self.assistant_transcript_item_id: str | None = None
         self.duplex_activation_lock = asyncio.Lock()
         self.duplex_input_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=500)
         self.duplex_sender_task: asyncio.Task[None] | None = None
@@ -523,11 +524,15 @@ class RealtimeKitAgent:
             logger.error(f"Error Sending stream message: {e}")
 
     async def _send_workspace_text_response(self, request_id: str, user_id: int, answer: str) -> None:
-        response = {"type": "workspace.agent.text.response", "request_id": request_id,
-                    "item_id": uuid.uuid4().hex, "agora_uid": user_id, "text": answer}
-        await self.channel.chat.send_message(
-            ChatMessage(message=json.dumps(response, ensure_ascii=False), msg_id=response["item_id"])
-        )
+        item_id = uuid.uuid4().hex
+        chunks = [answer[i:i + 120] for i in range(0, len(answer), 120)] or [""]
+        for index, chunk in enumerate(chunks):
+            response = {"type": "workspace.agent.text.response.chunk", "request_id": request_id,
+                        "item_id": item_id, "agora_uid": user_id, "index": index,
+                        "count": len(chunks), "text": chunk}
+            await self.channel.chat.send_message(
+                ChatMessage(message=json.dumps(response, ensure_ascii=False), msg_id=f"{item_id}-{index}")
+            )
 
     async def _request_participant_identities(self) -> None:
         await self.channel.chat.send_message(
@@ -555,7 +560,7 @@ class RealtimeKitAgent:
         normalized_words = re.sub(r"[^\w]+", " ", normalized).strip()
         phrases = os.getenv(
             "WORKSPACE_AGENT_WAKE_PHRASES",
-            "hey agent,hi agent,hello agent,你好助手,嘿助手,嗨助手",
+            "hey agent,hi agent,hello agent,hey assistant,hi assistant,你好助手,嘿助手,嗨助手,你好agent",
         )
         for phrase in (part.strip().casefold() for part in phrases.split(",")):
             if not phrase:
@@ -575,7 +580,7 @@ class RealtimeKitAgent:
         if state is None:
             return
         if final:
-            participant = self.participants_by_agora_uid.get(uid) or {}
+            participant = self.participants_by_agora_uid.get(int(uid)) or {}
             label = participant.get("displayName") or f"Agora UID {uid}"
             self.meeting_transcripts.append(f"{label}: {text}")
             logger.info("Workspace transcript [%s]: %s", label, text)
@@ -584,7 +589,7 @@ class RealtimeKitAgent:
                 "type": "conversation.item.input_audio_transcription.completed",
                 "item_id": item_id,
                 "transcript": text,
-                "agora_uid": uid,
+                "agora_uid": int(uid),
                 "player_id": participant.get("playerId", ""),
                 "display_name": participant.get("displayName", ""),
             }
@@ -672,7 +677,7 @@ class RealtimeKitAgent:
         async with self.duplex_activation_lock:
             if self.duplex_active_uid is not None and self.duplex_active_uid != uid:
                 return
-            participant = self.participants_by_agora_uid.get(uid) or {}
+            participant = self.participants_by_agora_uid.get(int(uid)) or {}
             speaker = participant.get("displayName") or f"Agora UID {uid}"
             context = "\n".join(self.meeting_transcripts)
             instructions = self.system_message + (
@@ -828,16 +833,25 @@ class RealtimeKitAgent:
 
     def _publish_transcript_event(self, event: ProviderTranscriptDelta | ProviderTranscriptDone) -> None:
         payload = json.loads(provider_event_to_json(event))
+        if event.role == "assistant":
+            if payload.get("item_id"):
+                self.assistant_transcript_item_id = str(payload["item_id"])
+            else:
+                if self.assistant_transcript_item_id is None:
+                    self.assistant_transcript_item_id = uuid.uuid4().hex
+                payload["item_id"] = self.assistant_transcript_item_id
+        if event.role == "assistant" and isinstance(event, ProviderTranscriptDone):
+            self.assistant_transcript_item_id = None
         if self.duplex_mode and event.role == "user" and self.duplex_active_uid is not None:
-            participant = self.participants_by_agora_uid.get(self.duplex_active_uid) or {}
-            payload["agora_uid"] = self.duplex_active_uid
+            participant = self.participants_by_agora_uid.get(int(self.duplex_active_uid)) or {}
+            payload["agora_uid"] = int(self.duplex_active_uid)
             payload["player_id"] = participant.get("playerId", "")
             payload["display_name"] = participant.get("displayName", "")
         asyncio.create_task(
             self.channel.chat.send_message(
                 ChatMessage(
                     message=json.dumps(payload, ensure_ascii=False),
-                    msg_id=event.item_id or "",
+                    msg_id=str(payload.get("item_id") or ""),
                 )
             )
         )
