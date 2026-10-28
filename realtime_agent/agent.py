@@ -597,8 +597,20 @@ class RealtimeKitAgent:
             state.forwarded = False
         self.duplex_awake = False
         self.duplex_active_uid = None
-        await self.provider.mute_input()
-        await self.provider.interrupt_response()
+        while not self.duplex_input_queue.empty():
+            self.duplex_input_queue.get_nowait()
+            self.duplex_input_queue.task_done()
+        while not self.audio_queue.empty():
+            self.audio_queue.get_nowait()
+        for action, label in (
+            (self.channel.clear_sender_audio_buffer, "clear Agora output"),
+            (self.provider.mute_input, "mute Duplex input"),
+            (self.provider.interrupt_response, "cancel Duplex response"),
+        ):
+            try:
+                await action()
+            except Exception:
+                logger.exception("Failed to %s while closing the Agent response window", label)
 
     async def _on_speaker_asr_text(self, uid: int, text: str, final: bool) -> None:
         state = self.speaker_states.get(uid)
@@ -609,6 +621,10 @@ class RealtimeKitAgent:
             label = participant.get("displayName") or f"Agora UID {uid}"
             self.meeting_transcripts.append(f"{label}: {text}")
             logger.info("Workspace transcript [%s]: %s", label, text)
+            should_stop = self._duplex_window_open() and self._contains_stop_phrase(text)
+            if should_stop:
+                logger.info("Agent stop phrase detected from Agora UID %s", uid)
+                await self._close_duplex_window()
             item_id = uuid.uuid4().hex
             payload = {
                 "type": "conversation.item.input_audio_transcription.completed",
@@ -624,9 +640,7 @@ class RealtimeKitAgent:
                 )
             except Exception:
                 logger.exception("Failed to publish ASR transcript for Agora UID %s", uid)
-            if self._duplex_window_open() and self._contains_stop_phrase(text):
-                logger.info("Agent stop phrase detected from Agora UID %s", uid)
-                await self._close_duplex_window()
+            if should_stop:
                 return
         if not self._duplex_window_open() and self._contains_wake_phrase(text):
             # The 20-second silence window starts after the reply. Give the
