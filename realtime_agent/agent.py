@@ -552,6 +552,7 @@ class RealtimeKitAgent:
     @staticmethod
     def _contains_wake_phrase(text: str) -> bool:
         normalized = text.casefold()
+        normalized_words = re.sub(r"[^\w]+", " ", normalized).strip()
         phrases = os.getenv(
             "WORKSPACE_AGENT_WAKE_PHRASES",
             "hey agent,hi agent,hello agent,你好助手,嘿助手,嗨助手",
@@ -562,7 +563,10 @@ class RealtimeKitAgent:
             if re.search(r"[\u4e00-\u9fff]", phrase):
                 if phrase.replace(" ", "") in normalized.replace(" ", ""):
                     return True
-            elif re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", normalized):
+            elif re.search(
+                r"(?<!\w)" + re.escape(re.sub(r"[^\w]+", " ", phrase).strip()) + r"(?!\w)",
+                normalized_words,
+            ):
                 return True
         return False
 
@@ -575,6 +579,21 @@ class RealtimeKitAgent:
             label = participant.get("displayName") or f"Agora UID {uid}"
             self.meeting_transcripts.append(f"{label}: {text}")
             logger.info("Workspace transcript [%s]: %s", label, text)
+            item_id = uuid.uuid4().hex
+            payload = {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": item_id,
+                "transcript": text,
+                "agora_uid": uid,
+                "player_id": participant.get("playerId", ""),
+                "display_name": participant.get("displayName", ""),
+            }
+            try:
+                await self.channel.chat.send_message(
+                    ChatMessage(message=json.dumps(payload, ensure_ascii=False), msg_id=item_id)
+                )
+            except Exception:
+                logger.exception("Failed to publish ASR transcript for Agora UID %s", uid)
         if not state.wake_requested and self._contains_wake_phrase(text):
             if self.duplex_active_uid is None or self.duplex_active_uid == uid:
                 state.wake_requested = True
@@ -955,7 +974,8 @@ class RealtimeKitAgent:
                     else:
                         self._publish_transcript_event(message)
                 case ProviderTranscriptDelta() if message.role == "user":
-                    self._publish_transcript_event(message)
+                    if not self.duplex_mode:
+                        self._publish_transcript_event(message)
                 case ProviderTranscriptDone() if message.role == "assistant":
                     if self.duplex_mode and not self.duplex_awake:
                         continue
@@ -966,7 +986,8 @@ class RealtimeKitAgent:
                         self._publish_transcript_event(message)
                 case ProviderTranscriptDone() if message.role == "user":
                     logger.info("User transcript done: %s", message.text)
-                    self._publish_transcript_event(message)
+                    if not self.duplex_mode:
+                        self._publish_transcript_event(message)
                     if not self.duplex_mode:
                         await self._handle_user_transcript(message.text, message.item_id)
                 case ProviderSpeechStarted():
