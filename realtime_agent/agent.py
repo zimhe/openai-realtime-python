@@ -324,10 +324,13 @@ class RealtimeKitAgent:
         self.duplex_active_until = 0.0
         self.duplex_window_task: asyncio.Task[None] | None = None
         self.duplex_turn_id = 0
+        self.duplex_response_started_turn: int | None = None
         self.duplex_audio_frames_queued = 0
         self.duplex_audio_frames_sent = 0
         self.duplex_first_reply_pending = False
         self.duplex_pending_utterances: deque[tuple[int, list[bytes]]] = deque(maxlen=8)
+        self.duplex_wake_while_busy_uid: int | None = None
+        self.duplex_wake_while_busy_at = 0.0
         self.assistant_transcript_item_id: str | None = None
         self.duplex_activation_lock = asyncio.Lock()
         self.duplex_input_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=500)
@@ -558,7 +561,7 @@ class RealtimeKitAgent:
                         "item_id": item_id, "agora_uid": user_id, "index": index,
                         "count": len(chunks), "text": chunk}
             await self.channel.chat.send_message(
-                ChatMessage(message=json.dumps(response, ensure_ascii=False), msg_id=f"{item_id}-{index}")
+                ChatMessage(message=json.dumps(response, ensure_ascii=False), msg_id=uuid.uuid4().hex)
             )
 
     async def _request_participant_identities(self) -> None:
@@ -638,8 +641,11 @@ class RealtimeKitAgent:
             self.duplex_turn_watchdog.cancel()
         self.duplex_turn_watchdog = None
         self.duplex_active_until = 0.0
+        self.duplex_response_started_turn = None
         self.duplex_first_reply_pending = False
         self.duplex_pending_utterances.clear()
+        self.duplex_wake_while_busy_uid = None
+        self.duplex_wake_while_busy_at = 0.0
         for state in self.speaker_states.values():
             state.wake_requested = False
             state.forwarded = False
@@ -670,6 +676,10 @@ class RealtimeKitAgent:
             self.meeting_transcripts.append(f"{label}: {text}")
             logger.info("Workspace transcript [%s]: %s", label, text)
             should_stop = self._duplex_window_open() and self._contains_stop_phrase(text)
+            if not should_stop and self.duplex_active_uid is not None and self._contains_wake_phrase(text):
+                self.duplex_wake_while_busy_uid = uid
+                self.duplex_wake_while_busy_at = time.monotonic()
+                logger.info("[DuplexTrace] wake_queued_during_busy_turn uid=%s busy_turn=%s", uid, self.duplex_turn_id)
             if should_stop:
                 logger.info("[DuplexTrace] stop_phrase uid=%s text=%r turn=%s", uid, text, self.duplex_turn_id)
                 await self._close_duplex_window("stop_phrase")
@@ -815,6 +825,10 @@ class RealtimeKitAgent:
             await self.provider.update_instructions(instructions)
             await self.provider.unmute_input()
             self.duplex_turn_id += 1
+            self.duplex_response_started_turn = None
+            if self.duplex_wake_while_busy_uid == uid:
+                self.duplex_wake_while_busy_uid = None
+                self.duplex_wake_while_busy_at = 0.0
             self.duplex_audio_frames_queued = 0
             self.duplex_audio_frames_sent = 0
             self.duplex_active_uid = uid
@@ -854,7 +868,18 @@ class RealtimeKitAgent:
             await asyncio.sleep(45)
             if self.duplex_active_uid == uid:
                 logger.warning("[DuplexTrace] turn_watchdog_timeout turn=%s uid=%s queued_frames=%s sent_frames=%s", self.duplex_turn_id, uid, self.duplex_audio_frames_queued, self.duplex_audio_frames_sent)
+                retry = None
+                if (self.duplex_wake_while_busy_uid is not None and
+                        time.monotonic() - self.duplex_wake_while_busy_at < 20.0):
+                    retry = next(((speaker_uid, frames) for speaker_uid, frames in reversed(self.duplex_pending_utterances)
+                                  if speaker_uid == self.duplex_wake_while_busy_uid and frames), None)
                 await self._close_duplex_window("turn_watchdog_timeout")
+                if retry is not None:
+                    self._start_duplex_window(60.0, "retry_wake_after_watchdog")
+                    self.duplex_first_reply_pending = True
+                    self.duplex_pending_utterances.append(retry)
+                    logger.info("[DuplexTrace] wake_retry_after_watchdog uid=%s frames=%s", retry[0], len(retry[1]))
+                    asyncio.create_task(self._resume_pending_duplex_utterance())
         except asyncio.CancelledError:
             return
 
@@ -1004,6 +1029,21 @@ class RealtimeKitAgent:
         if self.tools is None:
             logger.warning("Received tool call without configured tools: %s", message.name)
             return
+
+        if message.name in {"text_to_image", "refine_this_image", "refine_image_with_mask"}:
+            notice_id = uuid.uuid4().hex
+            notice = {
+                "type": "workspace.agent.text.response",
+                "item_id": notice_id,
+                "text": "I'm generating the image now. This may take about 30 seconds.",
+            }
+            try:
+                await self.channel.chat.send_message(
+                    ChatMessage(message=json.dumps(notice), msg_id=notice_id)
+                )
+                logger.info("Image generation progress notice sent: tool=%s item_id=%s", message.name, notice_id)
+            except Exception:
+                logger.exception("Failed to send image generation progress notice")
 
         try:
             result = await self.tools.execute_tool(message.name, message.arguments)
@@ -1219,10 +1259,15 @@ class RealtimeKitAgent:
                     else:
                         self.last_response_time = time.time()
                         if self.duplex_mode:
+                            self.duplex_response_started_turn = self.duplex_turn_id
                             logger.info("[DuplexTrace] response_started turn=%s uid=%s response_id=%s", self.duplex_turn_id, self.duplex_active_uid, message.response_id)
                 case ProviderResponseFinished():
                     self._expecting_provider_response = False
                     if self.duplex_mode:
+                        if self.duplex_response_started_turn != self.duplex_turn_id:
+                            logger.info("[DuplexTrace] response_finished_stale turn=%s response_id=%s", self.duplex_turn_id, message.response_id)
+                            continue
+                        self.duplex_response_started_turn = None
                         if self.duplex_turn_watchdog is not None:
                             self.duplex_turn_watchdog.cancel()
                             self.duplex_turn_watchdog = None
