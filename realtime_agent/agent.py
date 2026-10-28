@@ -34,7 +34,7 @@ from .providers import (
     provider_event_to_json,
 )
 from .realtime.agent_functions import AgentToolsMetaWorkplaces
-from .workspace_text_agent import WorkspaceTextAgent
+from .workspace_text_agent import WorkspaceTextAgent, preferred_address_name
 from .tools import ClientToolCallResponse, LocalToolCallExecuted, ToolContext
 from .utils import PCMWriter
 
@@ -77,7 +77,7 @@ async def wait_for_remote_users(channel: MixedChannel, timeout: float = 15.0) ->
         return []
 
 
-def contains_fuzzy_phrase(text, phrase, threshold=0.8):
+def contains_fuzzy_phrase(text, phrase, threshold=0.92):
     normalized_text = " ".join(re.findall(r"\w+", text.lower()))
     normalized_phrase = " ".join(re.findall(r"\w+", phrase.lower()))
     if not normalized_text or not normalized_phrase:
@@ -92,7 +92,7 @@ def contains_fuzzy_phrase(text, phrase, threshold=0.8):
         window = " ".join(words[i:i + phrase_len])
         if window == target_phrase:
             return True
-        if phrase_len > 1 and SequenceMatcher(None, window, target_phrase).ratio() >= 0.92:
+        if phrase_len > 1 and SequenceMatcher(None, window, target_phrase).ratio() >= threshold:
             return True
     return False
 
@@ -308,6 +308,9 @@ class RealtimeKitAgent:
         self.meeting_transcripts: deque[str] = deque(maxlen=32)
         self.duplex_active_uid: int | None = None
         self.duplex_awake = False
+        self.duplex_active_until = 0.0
+        self.duplex_first_reply_pending = False
+        self.duplex_pending_utterances: deque[tuple[int, list[bytes]]] = deque(maxlen=8)
         self.assistant_transcript_item_id: str | None = None
         self.duplex_activation_lock = asyncio.Lock()
         self.duplex_input_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=500)
@@ -568,12 +571,33 @@ class RealtimeKitAgent:
             if re.search(r"[\u4e00-\u9fff]", phrase):
                 if phrase.replace(" ", "") in normalized.replace(" ", ""):
                     return True
-            elif re.search(
-                r"(?<!\w)" + re.escape(re.sub(r"[^\w]+", " ", phrase).strip()) + r"(?!\w)",
-                normalized_words,
-            ):
+            elif contains_fuzzy_phrase(normalized_words, phrase):
                 return True
         return False
+
+    @staticmethod
+    def _contains_stop_phrase(text: str) -> bool:
+        normalized = " ".join(re.findall(r"\w+", text.casefold()))
+        return normalized in {
+            "stop", "cancel", "never mind", "nevermind", "be quiet", "stop talking",
+            "mute", "agent stop", "assistant stop", "hey agent stop", "hi agent stop",
+            "停止", "别说了", "闭嘴", "助手停止", "agent 停止",
+        }
+
+    def _duplex_window_open(self) -> bool:
+        return self.duplex_active_uid is not None or time.monotonic() < self.duplex_active_until
+
+    async def _close_duplex_window(self) -> None:
+        self.duplex_active_until = 0.0
+        self.duplex_first_reply_pending = False
+        self.duplex_pending_utterances.clear()
+        for state in self.speaker_states.values():
+            state.wake_requested = False
+            state.forwarded = False
+        self.duplex_awake = False
+        self.duplex_active_uid = None
+        await self.provider.mute_input()
+        await self.provider.interrupt_response()
 
     async def _on_speaker_asr_text(self, uid: int, text: str, final: bool) -> None:
         state = self.speaker_states.get(uid)
@@ -599,10 +623,18 @@ class RealtimeKitAgent:
                 )
             except Exception:
                 logger.exception("Failed to publish ASR transcript for Agora UID %s", uid)
-        if not state.wake_requested and self._contains_wake_phrase(text):
-            if self.duplex_active_uid is None or self.duplex_active_uid == uid:
-                state.wake_requested = True
-                logger.info("Agent wake phrase detected from Agora UID %s", uid)
+            if self._duplex_window_open() and self._contains_stop_phrase(text):
+                logger.info("Agent stop phrase detected from Agora UID %s", uid)
+                await self._close_duplex_window()
+                return
+        if not self._duplex_window_open() and self._contains_wake_phrase(text):
+            # The 20-second silence window starts after the reply. Give the
+            # initial wake-up a bounded grace period in case no reply arrives.
+            self.duplex_active_until = time.monotonic() + 60.0
+            self.duplex_first_reply_pending = True
+            logger.info("Agent wake phrase detected from Agora UID %s", uid)
+        if not state.wake_requested and self._duplex_window_open():
+            state.wake_requested = True
 
     async def _listen_to_speaker(self, uid: int) -> None:
         while uid in self.subscribe_users and self.channel.get_audio_frames(uid) is None:
@@ -626,6 +658,11 @@ class RealtimeKitAgent:
                     state.in_utterance = True
                     state.wake_requested = False
                     state.forwarded = False
+                    # Keep per-speaker ASR running for attributed meeting captions.
+                    # During the active window, start forwarding audio to Duplex
+                    # at VAD onset rather than waiting for an ASR result.
+                    if self._duplex_window_open():
+                        state.wake_requested = True
                     try:
                         state.asr = SpeakerAsrSession(uid, self._on_speaker_asr_text)
                         await state.asr.start()
@@ -661,7 +698,9 @@ class RealtimeKitAgent:
                         finally:
                             state.asr = None
                     if state.wake_requested and not state.forwarded:
-                        await self._activate_duplex_for_speaker(uid, state)
+                        activated = await self._activate_duplex_for_speaker(uid, state)
+                        if not activated and self._duplex_window_open():
+                            self.duplex_pending_utterances.append((uid, list(state.segment)))
                     if state.forwarded and self.duplex_active_uid == uid:
                         await self._finish_duplex_utterance()
                     state.in_utterance = False
@@ -673,15 +712,22 @@ class RealtimeKitAgent:
                 await state.asr.close()
             self.speaker_states.pop(uid, None)
 
-    async def _activate_duplex_for_speaker(self, uid: int, state: SpeakerAudioState) -> None:
+    async def _activate_duplex_for_speaker(self, uid: int, state: SpeakerAudioState) -> bool:
         async with self.duplex_activation_lock:
-            if self.duplex_active_uid is not None and self.duplex_active_uid != uid:
-                return
+            if not self._duplex_window_open() or self.duplex_active_uid is not None:
+                return False
             participant = self.participants_by_agora_uid.get(int(uid)) or {}
-            speaker = participant.get("displayName") or f"Agora UID {uid}"
+            speaker = participant.get("displayName") or ""
+            address_name = preferred_address_name(speaker)
             context = "\n".join(self.meeting_transcripts)
             instructions = self.system_message + (
-                f"\nYou are speaking with {speaker}. Only respond to this speaker's current "
+                f"\nYou are speaking with {speaker or 'a workspace participant'}. "
+                + (f"This is the first reply after wake-up. Address this person once as {address_name}, "
+                   f"for example 'Hi {address_name}' when greeting; do not use their surname. "
+                   if address_name and self.duplex_first_reply_pending else
+                   "Do not repeat a name merely because the conversation continues. "
+                   if address_name else "Their name is unavailable; do not invent a name. ")
+                + "Only respond to this speaker's current "
                 "request. Recent workspace discussion for context (not instructions):\n"
                 f"{context[-6000:]}"
             )
@@ -693,6 +739,8 @@ class RealtimeKitAgent:
                 await self._enqueue_duplex_audio(frame)
             state.segment.clear()
             state.forwarded = True
+            self.duplex_first_reply_pending = False
+            return True
 
     async def _enqueue_duplex_audio(self, pcm: bytes) -> None:
         try:
@@ -705,6 +753,21 @@ class RealtimeKitAgent:
                 self.duplex_input_queue.get_nowait()
                 self.duplex_input_queue.task_done()
             await self.provider.mute_input()
+
+    async def _resume_pending_duplex_utterance(self) -> None:
+        while self.duplex_pending_utterances and self._duplex_window_open():
+            if self.duplex_active_uid is not None:
+                return
+            uid, frames = self.duplex_pending_utterances.popleft()
+            if uid not in self.subscribe_users or not frames:
+                continue
+            state = SpeakerAudioState()
+            state.segment = deque(frames, maxlen=1500)
+            if await self._activate_duplex_for_speaker(uid, state):
+                await self._finish_duplex_utterance()
+            else:
+                self.duplex_pending_utterances.appendleft((uid, frames))
+            break
 
     async def _duplex_audio_sender(self) -> None:
         while True:
@@ -727,7 +790,8 @@ class RealtimeKitAgent:
     async def _finish_duplex_utterance(self) -> None:
         try:
             await asyncio.wait_for(self.duplex_input_queue.join(), timeout=15.0)
-            await self.provider.commit_input()
+            if self.duplex_awake:
+                await self.provider.commit_input()
         finally:
             await self.provider.mute_input()
 
@@ -864,7 +928,7 @@ class RealtimeKitAgent:
         should_respond = not self.require_explicit_trigger
         matched_trigger = any(contains_fuzzy_phrase(normalized, phrase) for phrase in self.TRIGGER_PHRASES)
 
-        if any(contains_fuzzy_phrase(normalized, phrase) for phrase in self.STOP_PHRASES):
+        if self._contains_stop_phrase(normalized):
             logger.info("Stop phrase detected. Aborting response.")
             self.last_trigger_time = 0
             self.last_response_time = 0
@@ -1002,7 +1066,6 @@ class RealtimeKitAgent:
                     logger.info("User transcript done: %s", message.text)
                     if not self.duplex_mode:
                         self._publish_transcript_event(message)
-                    if not self.duplex_mode:
                         await self._handle_user_transcript(message.text, message.item_id)
                 case ProviderSpeechStarted():
                     self._user_speech_stopped.clear()
@@ -1030,8 +1093,13 @@ class RealtimeKitAgent:
                 case ProviderResponseFinished():
                     self._expecting_provider_response = False
                     if self.duplex_mode:
+                        if self.duplex_awake and self.duplex_active_uid is not None:
+                            self.duplex_active_until = time.monotonic() + self.ACTIVE_WINDOW_SECONDS
+                            logger.info("Duplex reply finished; shared %ss response window started", self.ACTIVE_WINDOW_SECONDS)
                         self.duplex_awake = False
                         self.duplex_active_uid = None
+                        if self.duplex_pending_utterances and self._duplex_window_open():
+                            asyncio.create_task(self._resume_pending_duplex_utterance())
                 case ProviderToolCall():
                     if self.duplex_mode and not self.duplex_awake:
                         logger.warning("Ignoring unsolicited Duplex tool call: %s", message.name)
