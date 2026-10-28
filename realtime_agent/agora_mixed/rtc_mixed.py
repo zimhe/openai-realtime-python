@@ -51,6 +51,14 @@ class MixedChannelEventObserver(
         """Helper function to emit events."""
         self.loop.call_soon_threadsafe(self.emitter.emit, event_name, *args)
 
+    @staticmethod
+    def _enqueue_bounded(queue: asyncio.Queue, frame: PcmAudioFrame, max_frames: int = 200) -> None:
+        # Each provider consumes either the mixed track or the per-user tracks.
+        # Bound both so the unused track cannot grow throughout a meeting.
+        while queue.qsize() >= max_frames:
+            queue.get_nowait()
+        queue.put_nowait(frame)
+
     def on_connected(
         self, agora_rtc_conn: RTCConnection, conn_info: RTCConnInfo, reason
     ):
@@ -121,7 +129,7 @@ class MixedChannelEventObserver(
         audio_frame.bytes_per_sample = frame.bytes_per_sample
         audio_frame.number_of_channels = frame.channels
         audio_frame.sample_rate = self.options.sample_rate
-        audio_frame.data = frame.buffer
+        audio_frame.data = bytes(frame.buffer)
 
         # print(
         #     "on_playback_audio_frame_before_mixing",
@@ -132,9 +140,11 @@ class MixedChannelEventObserver(
         #     len(audio_frame.data),
         # )
         
-        self.loop.call_soon_threadsafe(
-            self.audio_streams[uid].queue.put_nowait, audio_frame
-        )
+        stream = self.audio_streams.get(uid)
+        if stream is not None:
+            self.loop.call_soon_threadsafe(
+                self._enqueue_bounded, stream.queue, audio_frame
+            )
         return 0
 
     def on_mixed_audio_frame(self, agora_local_user, channelId, frame):
@@ -145,10 +155,10 @@ class MixedChannelEventObserver(
             audio_frame.bytes_per_sample = frame.bytes_per_sample
             audio_frame.number_of_channels = frame.channels
             audio_frame.sample_rate = self.options.sample_rate
-            audio_frame.data = frame.buffer
+            audio_frame.data = bytes(frame.buffer)
             
             self.loop.call_soon_threadsafe(
-                self.mixed_audio_stream.queue.put_nowait, audio_frame
+                self._enqueue_bounded, self.mixed_audio_stream.queue, audio_frame
             )
               
         except Exception as e:

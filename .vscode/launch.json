@@ -17,9 +17,25 @@
             "module": "realtime_agent.main",
             "args": [
                 "agent",
-                "--channel_name", "test_channel"
+                "--channel_name",
+                "test_channel"
             ],
             "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Containers: Python - General",
+            "type": "docker",
+            "request": "launch",
+            "preLaunchTask": "docker-run: debug",
+            "python": {
+                "pathMappings": [
+                    {
+                        "localRoot": "${workspaceFolder}",
+                        "remoteRoot": "/app"
+                    }
+                ],
+                "projectType": "general"
+            }
         }
     ]
 }

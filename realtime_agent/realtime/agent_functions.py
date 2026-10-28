@@ -1,29 +1,36 @@
 from typing import Any
+from datetime import datetime, timezone
+from urllib.parse import quote, urlparse
+import hashlib
+import hmac
 
-import replicate.prediction
 from realtime_agent.tools import ToolContext
 
 from agora_realtime_ai_api.rtc import Channel, ChatMessage, RtcEngine, RtcOptions
 from .struct import to_json
 from ..utils import PCMWriter
 import asyncio
-import replicate
 import uuid
 import json
 import aiohttp
 import os
+import logging
+from contextvars import ContextVar
 from openai import OpenAI
 
-# Function calling Example
-# This is an example of how to add a new function to the agent tools.
-
-t2i_api="black-forest-labs/flux-kontext-pro"
-t2i_condition_api="black-forest-labs/flux-depth-pro"
-t2i_image_mask_api="black-forest-labs/flux-fill-pro"
-aliyun_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
-aliyun_model_id="qwen2.5-vl-7b-instruct"
+ark_image_url = os.environ.get("ARK_IMAGE_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
+ark_image_model_id = os.environ.get("ARK_IMAGE_MODEL_ID", "doubao-seedream-5-0-lite-260128")
+ark_image_size = os.environ.get("ARK_IMAGE_SIZE", "2K")
+ark_api_key = os.environ.get("ARK_API_KEY")
+visual_base_url = os.environ.get("VOLCENGINE_VISUAL_BASE_URL", "https://visual.volcengineapi.com")
+visual_region = os.environ.get("VOLCENGINE_VISUAL_REGION", "cn-north-1")
+visual_service = os.environ.get("VOLCENGINE_VISUAL_SERVICE", "cv")
+visual_submit_action = "CVSync2AsyncSubmitTask"
+visual_get_result_action = "CVSync2AsyncGetResult"
+visual_api_version = "2022-08-31"
 
 T2I_OUTPUT="text2image.output"
+logger = logging.getLogger(__name__)
 
 class AgentToolsMetaWorkplaces(ToolContext):
     def __init__(self) -> None:
@@ -32,13 +39,11 @@ class AgentToolsMetaWorkplaces(ToolContext):
         self.agent=None
         self.channel=None
         self.screen_keys=None
-        self.openai_client=OpenAI()
+        self.selected_screen_by_uid={}
+        self.request_screen_key: ContextVar[str | None] = ContextVar("request_screen_key", default=None)
         self.history_images={}
+        self.pending_image_tasks: set[asyncio.Task] = set()
         self.t2i_condition_queue=asyncio.Queue()
-        self.aliyun_client=OpenAI(
-            base_url=aliyun_url,
-            api_key=os.environ.get("ALIYUN_API_KEY")
-            )
         
 
         self.register_function(
@@ -125,18 +130,6 @@ class AgentToolsMetaWorkplaces(ToolContext):
         )
         
         self.register_function(
-            name="get_web_search_results",
-            description="perform an online search for relevant information based on given query keywords, can be used when ever the user querys something that is not in the local knowledge base, the function will return a json object with the search results",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The search query string."},
-                },
-            },
-            fn=self._get_web_search_results,
-        )
-        
-        self.register_function(
             name="get_history_image_info",
             description="get the history images info with json format, can be used to when user queries the previous generation records, the function will return a json object with the history images info, including the message id, the prompt and image url",
             parameters={
@@ -144,26 +137,6 @@ class AgentToolsMetaWorkplaces(ToolContext):
                 "properties": {},
             },
             fn=self._get_history_images_data,
-        )
-        
-        self.register_function(
-            name="interpert_image",
-            description="interpert the image with given query, the image url should be a valid url",
-            parameters={
-                "type":"object",
-                "properties":{
-                    "image_url":{
-                        "type":"string",
-                        "description":"the image url that needs to be interpreted"
-                    },
-                    "query":{
-                        "type":"string",
-                        "description":"the query that needs to be interpreted"
-                    }
-                },
-                "required":["image_url","query"]
-            },
-            fn=self._interpert_image,
         )
         
         self.register_function(
@@ -202,7 +175,27 @@ class AgentToolsMetaWorkplaces(ToolContext):
         self.channel=agent.channel
         
     def set_screen_context(self,screen_keys):
-        self.screen_keys=screen_keys
+        self.screen_keys=sorted(set(screen_keys or []))
+
+    def set_selected_screen(self, uid: int, key: str | None):
+        if key and key in (self.screen_keys or []):
+            self.selected_screen_by_uid[uid] = key
+        else:
+            self.selected_screen_by_uid.pop(uid, None)
+
+    def resolve_screen_key(self, screen_id: int) -> str | None:
+        if screen_id == -1:
+            return None
+        if screen_id == -2:
+            key = self.request_screen_key.get()
+            if not key and self.agent is not None:
+                key = self.selected_screen_by_uid.get(getattr(self.agent, "duplex_active_uid", None))
+            if not key or key not in (self.screen_keys or []):
+                raise ValueError("No valid selected screen is registered for the requesting user")
+            return key
+        if screen_id < 1 or screen_id > len(self.screen_keys or []):
+            raise ValueError(f"Screen {screen_id} is not registered")
+        return self.screen_keys[screen_id - 1]
         
     
     def format_t2i_result(self, output, screen_key,item_id):
@@ -213,140 +206,303 @@ class AgentToolsMetaWorkplaces(ToolContext):
         self.history_images[msg_id]={"prompt": prompt, "image_url": image_url}
         
 
-    async def _text2image(self,prompt:str,screen_id:int=-1) -> dict[str, Any]:
-        try:
-            input = { "prompt": prompt,"output_format":"png","aspect_ratio":"16:9" }
-            
-            output=await replicate.async_run(t2i_api,input,use_file_output=False)
-            
-            screen_key=None
-            proper_screen_id=screen_id-1
-            
-            if screen_id==-2:
-                screen_key="selected"
-            elif screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
-                screen_key=self.screen_keys[proper_screen_id]
-            
-            if isinstance(output, list):
-                output=output[0]  # Ensure we get the first image if multiple are returned
-            
-            msg_id=uuid.uuid4().hex
-            
-            result=self.format_t2i_result(output,screen_key,msg_id)
-            
-            chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
-            
-            self.append_history_image(msg_id,prompt,output)
-            
-            await self.channel.chat.send_message(chat_message)
-            
-            return {
-                "status": "success",
-                "message": f"text to image success, the result is {output[0]}",
-                "result": output[0],
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to get : {str(e)}",
-            }
-            
-            
+    async def _text2image(self, prompt: str, screen_id: int = -1) -> dict[str, Any]:
+        return self._schedule_image_job("generate", prompt, screen_id)
 
-    async def _refine_this_image(self,prompt: str,input_image:str,screen_id:int=-1) -> dict[str, Any]:
-        try:
-            input = { 
-                     "prompt": prompt,
-                     "aspect_ratio":"match_input_image",
-                     "output_format":"png",
-                     "input_image":input_image
-                     }
-            
-            output=await replicate.async_run(t2i_api,input,use_file_output=False)
-            
-            if isinstance(output, list):
-                output=output[0]  # Ensure we get the first image if multiple are returned
-            
+    async def _refine_this_image(self, prompt: str, input_image: str, screen_id: int = -1) -> dict[str, Any]:
+        return self._schedule_image_job("refine", prompt, screen_id, input_image=input_image)
 
-            screen_key=None
-            proper_screen_id=screen_id-1
-            
-            if screen_id==-2:
-                screen_key="selected"
-            elif screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
-                screen_key=self.screen_keys[proper_screen_id]
-            
-            
-            msg_id=uuid.uuid4().hex
-            result=self.format_t2i_result(output,screen_key,msg_id)
-            
-            chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
-            
-            self.append_history_image(msg_id,prompt,output)
-            
-            await self.channel.chat.send_message(chat_message)
-            
-            return {
-                "status": "success",
-                "message": f"text to image success, the result is {output}",
-                "result": output[0],
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to get : {str(e)}",
-            }
-            
-            
-    async def _refine_image_with_mask(self,prompt:str,image_url:str,mask_url:str,screen_id:int=-1)-> dict[str, Any]:
-        try:
+    async def _refine_image_with_mask(self, prompt: str, image_url: str, mask_url: str,
+                                      screen_id: int = -1) -> dict[str, Any]:
+        return self._schedule_image_job("inpaint", prompt, screen_id, input_image=image_url, mask_url=mask_url)
 
-            input={
-                    "mask": mask_url,
-                    "image": image_url,
-                    "steps": 30,
-                    "prompt": prompt,
-                    "guidance": 60,
-                    "outpaint": "None",
-                    "output_format": "png",
-                    "safety_tolerance": 2,
-                    "prompt_upsampling": False
-                }
-            
-            output=await replicate.async_run(t2i_image_mask_api,input,use_file_output=False)
-            
-            screen_key=None
-            proper_screen_id=screen_id-1
-            
-            if screen_id==-2:
-                screen_key="selected"
-            elif screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
-                screen_key=self.screen_keys[proper_screen_id]
-            
-            
-            if isinstance(output, list):
-                output=output[0]  # Ensure we get the first image if multiple are returned
-            
-            msg_id=uuid.uuid4().hex
-            
-            result=self.format_t2i_result(output,screen_key,msg_id)
-            
-            chat_message=ChatMessage(message=json.dumps(result),msg_id=msg_id)
-            
-            self.append_history_image(msg_id,prompt,output)
-            
-            await self.channel.chat.send_message(chat_message)
-            
+    def _schedule_image_job(self, kind: str, prompt: str, screen_id: int,
+                            input_image: str | None = None, mask_url: str | None = None) -> dict[str, Any]:
+        try:
+            if not prompt or not prompt.strip():
+                raise ValueError("Image prompt is empty")
+            if self.channel is None:
+                raise RuntimeError("Agent channel is not connected")
+            if kind != "inpaint" and not ark_api_key:
+                raise RuntimeError("ARK_API_KEY is required for Seedream image generation")
+            # Resolve while the request's screen selection and speaker context are still available.
+            screen_key = self.resolve_screen_key(screen_id)
+            task_id = uuid.uuid4().hex
+            task = asyncio.create_task(self._run_image_job(
+                task_id, kind, prompt, screen_key, input_image, mask_url))
+            self.pending_image_tasks.add(task)
+            task.add_done_callback(self.pending_image_tasks.discard)
+            logger.info("Image task queued: id=%s kind=%s screen=%s", task_id, kind, screen_key)
             return {
-                "status": "success",
-                "message": f"refine image success, the result is {output}",
-                "result": output,
+                "status": "queued",
+                "task_id": task_id,
+                "message": "Image generation has been scheduled. Tell the user it will appear in the conversation when ready; do not claim it is finished.",
             }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to get : {str(e)}",
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+    async def _run_image_job(self, task_id: str, kind: str, prompt: str,
+                             screen_key: str | None, input_image: str | None,
+                             mask_url: str | None) -> None:
+        try:
+            if kind == "generate":
+                output = await self._generate_seedream_image(prompt=prompt)
+            elif kind == "refine":
+                output = await self._generate_seedream_image(prompt=prompt, image=input_image)
+            else:
+                output = await self._generate_visual_inpaint_image(
+                    prompt=prompt, image_url=input_image, mask_url=mask_url)
+            if not output:
+                raise RuntimeError("Image service returned no image URL")
+            result = self.format_t2i_result(output, screen_key, task_id)
+            await self.channel.chat.send_message(
+                ChatMessage(message=json.dumps(result), msg_id=task_id))
+            self.append_history_image(task_id, prompt, output)
+            logger.info("Image task completed: id=%s kind=%s", task_id, kind)
+        except asyncio.CancelledError:
+            logger.info("Image task cancelled: id=%s", task_id)
+            raise
+        except Exception as exc:
+            logger.exception("Image task failed: id=%s kind=%s", task_id, kind)
+            failure = {
+                "type": "workspace.agent.text.response",
+                "item_id": task_id,
+                "text": "Image generation failed. Please try again.",
             }
+            try:
+                await self.channel.chat.send_message(
+                    ChatMessage(message=json.dumps(failure), msg_id=task_id))
+            except Exception:
+                logger.exception("Could not notify clients that image task %s failed", task_id)
+
+    async def cancel_image_tasks(self) -> None:
+        tasks = tuple(self.pending_image_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _generate_seedream_image(self, *, prompt: str, image: str | None = None) -> str | None:
+        if not ark_api_key:
+            raise RuntimeError("ARK_API_KEY must be set for Seedream image generation")
+
+        client = OpenAI(api_key=ark_api_key, base_url=ark_image_url)
+        extra_body: dict[str, Any] = {
+            "sequential_image_generation": "disabled",
+            "watermark": False,
+        }
+        if image:
+            extra_body["image"] = image
+
+        response = await asyncio.to_thread(
+            client.images.generate,
+            model=ark_image_model_id,
+            prompt=prompt,
+            size=ark_image_size,
+            response_format="url",
+            extra_body=extra_body,
+        )
+
+        generated = getattr(response, "data", None) or []
+        for item in generated:
+            url = getattr(item, "url", None)
+            if url:
+                return url
+        return None
+
+    async def _generate_visual_inpaint_image(self, *, prompt: str, image_url: str, mask_url: str) -> str | None:
+        task_payload = {
+            "req_key": "i2i_inpainting_edit",
+            "image_urls": [image_url, mask_url],
+            "custom_prompt": prompt,
+            "steps": int(os.environ.get("VOLCENGINE_VISUAL_INPAINT_STEPS", "25")),
+            "scale": float(os.environ.get("VOLCENGINE_VISUAL_INPAINT_SCALE", "5")),
+            "seed": int(os.environ.get("VOLCENGINE_VISUAL_INPAINT_SEED", "-1")),
+        }
+        submit_response = await self._visual_signed_post(visual_submit_action, task_payload)
+        if not self._is_visual_success_code(submit_response.get("code")):
+            raise RuntimeError(submit_response.get("message") or "Volcengine visual inpaint submit failed")
+
+        task_id = str((submit_response.get("data") or {}).get("task_id") or "").strip()
+        if not task_id:
+            raise RuntimeError("Volcengine visual inpaint submit did not return task_id")
+
+        max_attempts = int(os.environ.get("VOLCENGINE_VISUAL_INPAINT_MAX_ATTEMPTS", "30"))
+        poll_interval_seconds = float(os.environ.get("VOLCENGINE_VISUAL_INPAINT_POLL_SECONDS", "2"))
+
+        for attempt in range(max_attempts):
+            result_response = await self._visual_signed_post(
+                visual_get_result_action,
+                {"task_id": task_id},
+            )
+            if not self._is_visual_success_code(result_response.get("code")):
+                raise RuntimeError(result_response.get("message") or "Volcengine visual inpaint polling failed")
+
+            data = result_response.get("data") or {}
+            extracted_url = self._extract_first_image_url(data)
+            if extracted_url:
+                return extracted_url
+
+            status = str(
+                data.get("status")
+                or data.get("task_status")
+                or data.get("state")
+                or data.get("phase")
+                or ""
+            ).strip().lower()
+
+            if status in {"failed", "error", "timeout", "canceled", "cancelled"}:
+                raise RuntimeError(data.get("message") or data.get("error") or f"Volcengine visual inpaint task failed: {status}")
+
+            if attempt == max_attempts - 1:
+                break
+
+            await asyncio.sleep(poll_interval_seconds)
+
+        raise RuntimeError("Volcengine visual inpaint task did not finish before timeout")
+
+    async def _visual_signed_post(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        access_key_id, secret_access_key, security_token = self._get_visual_credentials()
+
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        content_sha256 = hashlib.sha256(body).hexdigest()
+
+        endpoint = urlparse(visual_base_url)
+        host = endpoint.netloc
+        path = endpoint.path or "/"
+        timestamp = datetime.now(timezone.utc)
+        x_date = timestamp.strftime("%Y%m%dT%H%M%SZ")
+        short_date = x_date[:8]
+
+        query = {
+            "Action": action,
+            "Version": visual_api_version,
+        }
+        canonical_query = "&".join(
+            f"{quote(key, safe='-_.~')}={quote(value, safe='-_.~')}"
+            for key, value in sorted(query.items())
+        )
+        signed_headers = "content-type;host;x-content-sha256;x-date"
+        canonical_headers = (
+            f"content-type:application/json\n"
+            f"host:{host}\n"
+            f"x-content-sha256:{content_sha256}\n"
+            f"x-date:{x_date}\n"
+        )
+        canonical_request = (
+            f"POST\n"
+            f"{path}\n"
+            f"{canonical_query}\n"
+            f"{canonical_headers}\n"
+            f"{signed_headers}\n"
+            f"{content_sha256}"
+        )
+        credential_scope = f"{short_date}/{visual_region}/{visual_service}/request"
+        string_to_sign = (
+            f"HMAC-SHA256\n"
+            f"{x_date}\n"
+            f"{credential_scope}\n"
+            f"{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+        )
+
+        signing_key = self._sign_hmac(
+            self._sign_hmac(
+                self._sign_hmac(
+                    self._sign_hmac(secret_access_key.encode("utf-8"), short_date),
+                    visual_region,
+                ),
+                visual_service,
+            ),
+            "request",
+        )
+        signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+        headers = {
+            "Content-Type": "application/json",
+            "Host": host,
+            "X-Date": x_date,
+            "X-Content-Sha256": content_sha256,
+            "Authorization": (
+                f"HMAC-SHA256 Credential={access_key_id}/{credential_scope}, "
+                f"SignedHeaders={signed_headers}, Signature={signature}"
+            ),
+        }
+        if security_token:
+            headers["X-Security-Token"] = security_token
+
+        request_url = f"{visual_base_url}?{canonical_query}"
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                request_url,
+                data=body,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as response:
+                response.raise_for_status()
+                return await response.json()
+
+    def _get_visual_credentials(self) -> tuple[str, str, str | None]:
+        access_key_id = (
+            os.environ.get("VOLCENGINE_VISUAL_ACCESS_KEY_ID")
+            or os.environ.get("VOLCENGINE_ACCESS_KEY_ID")
+            or ""
+        ).strip()
+        secret_access_key = (
+            os.environ.get("VOLCENGINE_VISUAL_SECRET_ACCESS_KEY")
+            or os.environ.get("VOLCENGINE_SECRET_ACCESS_KEY")
+            or ""
+        ).strip()
+        security_token = (
+            os.environ.get("VOLCENGINE_VISUAL_SESSION_TOKEN")
+            or os.environ.get("VOLCENGINE_SESSION_TOKEN")
+            or None
+        )
+
+        if not access_key_id or not secret_access_key:
+            raise RuntimeError(
+                "VOLCENGINE_VISUAL_ACCESS_KEY_ID and VOLCENGINE_VISUAL_SECRET_ACCESS_KEY must be set for visual inpaint"
+            )
+
+        return access_key_id, secret_access_key, security_token
+
+    def _sign_hmac(self, key: bytes, message: str) -> bytes:
+        return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
+
+    def _is_visual_success_code(self, code: Any) -> bool:
+        return str(code).strip() == "10000"
+
+    def _extract_first_image_url(self, data: Any) -> str | None:
+        if isinstance(data, dict):
+            direct_url = data.get("url") or data.get("image_url")
+            if isinstance(direct_url, str) and direct_url:
+                return direct_url
+
+            image_urls = data.get("image_urls") or data.get("urls") or data.get("result")
+            if isinstance(image_urls, list):
+                for item in image_urls:
+                    extracted = self._extract_first_image_url(item)
+                    if extracted:
+                        return extracted
+            elif isinstance(image_urls, str) and image_urls:
+                return image_urls
+
+            for value in data.values():
+                extracted = self._extract_first_image_url(value)
+                if extracted:
+                    return extracted
+            return None
+
+        if isinstance(data, list):
+            for item in data:
+                extracted = self._extract_first_image_url(item)
+                if extracted:
+                    return extracted
+            return None
+
+        if isinstance(data, str) and data.startswith(("http://", "https://")):
+            return data
+
+        return None
     
             
     async def _get_history_images_data(self)-> dict[str, Any]:
@@ -366,10 +522,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
             
     async def _cast_image_to_screen(self,image_url,screen_id=1)-> dict[str, Any]:
         try:
-            screen_key=None
-            proper_screen_id=screen_id-1
-            if screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
-                screen_key=self.screen_keys[proper_screen_id]
+            screen_key=self.resolve_screen_key(screen_id)
             
             msg_id=uuid.uuid4().hex
             
@@ -389,75 +542,3 @@ class AgentToolsMetaWorkplaces(ToolContext):
                 "status": "error",
                 "message": f"Failed to cast image to screen, {e}",
             }
-           
-            
-    async def _get_web_search_results(self,query: str) -> dict[str, Any]:
-        """
-        本地函数: 通过 OpenAI 的 gpt-4o-search-preview 执行网络搜索
-        """
-        try:
-            response = self.openai_client.chat.completions.create(
-                model="gpt-4o-search-preview",
-                # web_search_options={
-                #     "search_context_size": "low",  # 设定搜索范围
-                # },
-                messages=[{
-                    "role": "user",
-                    "content": query,
-                }],
-            )
-
-            # 解析返回结果
-            result_text = response.choices[0].message.content if response.choices else "No results found"
-
-            return {
-                "status": "success",
-                "message": f"Search results for '{query}': {result_text}",
-                "result": result_text,
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to fetch search results: {str(e)}",
-            }
-    async def _interpert_image(self,image_url:str,query: str) -> dict[str, Any]:
-        message={
-            "role": "user",
-            "content":[
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": image_url,
-                    }
-                },
-                {
-                    "type": "text",
-                    "text": query,
-                }
-            ]
-        }
-         
-        try:
-            completion = self.aliyun_client.chat.completions.create(
-                model=aliyun_model_id,
-                stream=False,
-                max_tokens=512,
-                temperature=0.7,
-                messages=[message]
-            )
-            
-            data = json.loads(completion.model_dump_json())
-            result = data["choices"][0]["message"]["content"]
-            
-            return {
-                "status": "success",
-                "message": f"Image interpertation for '{query}': {result}",
-                "result": result,
-            }
-
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to interpret image: {str(e)}",
-            }
-         

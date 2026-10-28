@@ -1,0 +1,6 @@
+services:
+  openairealtimepython:
+    image: openairealtimepython
+    build:
+      context: .
+      dockerfile: ./Dockerfile
