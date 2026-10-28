@@ -3,6 +3,7 @@ import os
 from .openai_provider import OpenAIRealtimeProvider
 from .volcengine_provider import VolcengineRealtimeProvider
 from .volcengine_split_provider import DEFAULT_SPLIT_TTS_VOICE, VolcengineSplitRealtimeProvider
+from .volcengine_duplex_provider import VolcengineDuplexRealtimeProvider
 
 from .base import (
     DEFAULT_OPENAI_VOICE,
@@ -51,7 +52,7 @@ __all__ = [
 
 def get_realtime_provider_name() -> ProviderName:
     provider = os.getenv("REALTIME_PROVIDER", "volcengine_split").strip().lower()
-    if provider not in {"openai", "volcengine", "volcengine_split"}:
+    if provider not in {"openai", "volcengine", "volcengine_split", "volcengine_duplex"}:
         raise ValueError(f"Unsupported REALTIME_PROVIDER: {provider}")
     return provider  # type: ignore[return-value]
 
@@ -72,7 +73,7 @@ def normalize_provider_voice(provider: ProviderName, voice: str | None) -> str:
     if provider == "volcengine_split" and normalized_voice in OPENAI_REALTIME_VOICES | {DEFAULT_VOLCENGINE_VOICE}:
         return DEFAULT_SPLIT_TTS_VOICE
 
-    if provider in {"volcengine", "volcengine_split"} and normalized_voice in OPENAI_REALTIME_VOICES:
+    if provider in {"volcengine", "volcengine_split", "volcengine_duplex"} and normalized_voice in OPENAI_REALTIME_VOICES:
         return DEFAULT_VOLCENGINE_VOICE
 
     return normalized_voice
@@ -84,4 +85,6 @@ def create_realtime_provider(*, verbose: bool = False) -> RealtimeProviderConnec
         return OpenAIRealtimeProvider(verbose=verbose)
     if provider == "volcengine_split":
         return VolcengineSplitRealtimeProvider(verbose=verbose)
+    if provider == "volcengine_duplex":
+        return VolcengineDuplexRealtimeProvider(verbose=verbose)
     return VolcengineRealtimeProvider(verbose=verbose)

@@ -24,6 +24,7 @@ from .logger import setup_logger
 from .parse_args import parse_args, parse_args_realtimekit
 from .office_directory import install_office_directory
 from .token_service import install_token_service
+from .streamoji_auth import install_streamoji_auth
 
 import openai
 
@@ -320,6 +321,7 @@ async def init_app():
 
     install_office_directory(app)
     install_token_service(app)
+    install_streamoji_auth(app)
 
     # Add cleanup task to run on app exit
     app.on_cleanup.append(shutdown)

@@ -22,7 +22,7 @@ OPENAI_REALTIME_VOICES = {
     "shimmer",
 }
 
-ProviderName = Literal["openai", "volcengine", "volcengine_split"]
+ProviderName = Literal["openai", "volcengine", "volcengine_split", "volcengine_duplex"]
 TranscriptRole = Literal["user", "assistant"]
 
 

@@ -4,7 +4,9 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+import uuid
+from collections import deque
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any, List
 
@@ -14,6 +16,7 @@ from openai import OpenAI
 from .agora_mixed.rtc_mixed import MixedChannel, MixedRtcEngine
 
 from .logger import setup_logger
+from .workspace_speech_listener import EnergySpeechDetector, SpeakerAsrSession
 from .providers import (
     ProviderAudioChunk,
     ProviderError,
@@ -209,6 +212,17 @@ class InferenceConfig:
     dialog_id: str | None = None
 
 
+@dataclass
+class SpeakerAudioState:
+    detector: EnergySpeechDetector = field(default_factory=EnergySpeechDetector)
+    pre_roll: deque[bytes] = field(default_factory=lambda: deque(maxlen=50))
+    segment: deque[bytes] = field(default_factory=lambda: deque(maxlen=1500))
+    asr: SpeakerAsrSession | None = None
+    wake_requested: bool = False
+    forwarded: bool = False
+    in_utterance: bool = False
+
+
 class RealtimeKitAgent:
     engine: MixedRtcEngine
     channel: MixedChannel
@@ -252,6 +266,7 @@ class RealtimeKitAgent:
                     provider=provider,
                     tools=tools,
                     channel=channel,
+                    system_message=inference_config.system_message,
                     require_explicit_trigger=bool(
                         inference_config.turn_detection is not None
                         and getattr(inference_config.turn_detection, "create_response", True) is False
@@ -272,14 +287,26 @@ class RealtimeKitAgent:
         provider: RealtimeProviderConnection,
         tools: ToolContext | None,
         channel: MixedChannel,
+        system_message: str | None,
         require_explicit_trigger: bool,
     ) -> None:
         self.provider = provider
         self.tools = tools
         self._client_tool_futures = {}
         self.channel = channel
+        self.system_message = system_message or ""
+        self.duplex_mode = provider.provider_name == "volcengine_duplex"
         self.audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self.subscribe_users = set()
+        self.participants_by_agora_uid: dict[int, dict[str, str]] = {}
+        self.speaker_states: dict[int, SpeakerAudioState] = {}
+        self.speaker_tasks: dict[int, asyncio.Task[None]] = {}
+        self.meeting_transcripts: deque[str] = deque(maxlen=32)
+        self.duplex_active_uid: int | None = None
+        self.duplex_awake = False
+        self.duplex_activation_lock = asyncio.Lock()
+        self.duplex_input_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=500)
+        self.duplex_sender_task: asyncio.Task[None] | None = None
         self.write_pcm = os.environ.get("WRITE_AGENT_PCM", "false") == "true"
         logger.info(f"Write PCM: {self.write_pcm}")
         self.last_trigger_time = 0
@@ -311,6 +338,8 @@ class RealtimeKitAgent:
 
     async def run(self) -> None:
         try:
+            if self.duplex_mode:
+                await self.provider.mute_input()
 
             def log_exception(t: asyncio.Task[Any]) -> None:
                 if not t.cancelled() and t.exception():
@@ -328,6 +357,9 @@ class RealtimeKitAgent:
                     self.subscribe_users.add(user_id)
                     await self.channel.subscribe_audio(user_id)
                     logger.info(f"Subscribed to user {user_id}, current users: {self.subscribe_users}")
+                if self.duplex_mode:
+                    self._start_speaker_task(user_id)
+                await self._request_participant_identities()
 
             self.channel.on("user_joined", on_user_joined)
 
@@ -347,11 +379,25 @@ class RealtimeKitAgent:
                     await self.channel.subscribe_audio(user_id)
                     self.subscribe_users.add(user_id)
                     logger.info(f"Subscribed to user outside <on_user_joined> {user_id}, current users: {self.subscribe_users}")
+                if self.duplex_mode:
+                    self._start_speaker_task(user_id)
 
             async def on_user_left(
                 agora_rtc_conn: RTCConnection, user_id: int, reason: int
             ):
                 logger.info(f"User left: {user_id}")
+                self.participants_by_agora_uid.pop(user_id, None)
+                speaker_task = self.speaker_tasks.pop(user_id, None)
+                if speaker_task is not None:
+                    speaker_task.cancel()
+                if self.duplex_mode and self.duplex_active_uid == user_id:
+                    self.duplex_awake = False
+                    self.duplex_active_uid = None
+                    while not self.duplex_input_queue.empty():
+                        self.duplex_input_queue.get_nowait()
+                        self.duplex_input_queue.task_done()
+                    await self.provider.mute_input()
+                    await self.provider.interrupt_response()
                 if user_id in self.subscribe_users:
                     self.subscribe_users.discard(user_id)
                     logger.info(f"Subscribed user {user_id} left, removed from user list")
@@ -372,10 +418,16 @@ class RealtimeKitAgent:
 
             self.channel.on("connection_state_changed", callback)
 
-            asyncio.create_task(self.rtc_to_model()).add_done_callback(log_exception)
+            if self.duplex_mode:
+                self.duplex_sender_task = asyncio.create_task(self._duplex_audio_sender())
+                self.duplex_sender_task.add_done_callback(log_exception)
+            else:
+                asyncio.create_task(self.rtc_to_model()).add_done_callback(log_exception)
             asyncio.create_task(self.model_to_rtc()).add_done_callback(log_exception)
 
             asyncio.create_task(self._process_model_messages()).add_done_callback(log_exception)
+
+            await self._request_participant_identities()
 
             await disconnected_future
             logger.info("Agent finished running")
@@ -384,10 +436,29 @@ class RealtimeKitAgent:
         except Exception as e:
             logger.error(f"Error running agent: {e}")
             raise
+        finally:
+            for task in self.speaker_tasks.values():
+                task.cancel()
+            if self.duplex_sender_task is not None:
+                self.duplex_sender_task.cancel()
 
     async def _process_stream_message(self, user_id, stream_id, data, length) -> None:
         try:
             text = data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else str(data)
+
+            if text.startswith("workspace.identity:"):
+                payload = json.loads(text[len("workspace.identity:"):])
+                if not isinstance(payload, dict):
+                    return
+                player_id = str(payload.get("playerId") or "").strip()
+                display_name = str(payload.get("displayName") or "").strip()
+                if player_id and len(player_id) <= 128 and len(display_name) <= 64:
+                    self.participants_by_agora_uid[int(user_id)] = {
+                        "playerId": player_id,
+                        "displayName": display_name,
+                    }
+                    logger.info("Bound Agora UID %s to workspace participant %s", user_id, player_id)
+                return
 
             if self.require_explicit_trigger and not self.provider.capabilities.supports_manual_responses:
                 current_time = time.time()
@@ -404,6 +475,184 @@ class RealtimeKitAgent:
                 await self.provider.request_response()
         except Exception as e:
             logger.error(f"Error Sending stream message: {e}")
+
+    async def _request_participant_identities(self) -> None:
+        await self.channel.chat.send_message(
+            ChatMessage(
+                message='{"type":"workspace.identity.request"}',
+                msg_id=uuid.uuid4().hex,
+            )
+        )
+
+    def _start_speaker_task(self, uid: int) -> None:
+        if uid in self.speaker_tasks and not self.speaker_tasks[uid].done():
+            return
+        task = asyncio.create_task(self._listen_to_speaker(uid))
+        self.speaker_tasks[uid] = task
+
+        def log_speaker_error(completed: asyncio.Task[None]) -> None:
+            if not completed.cancelled() and completed.exception():
+                logger.error("Speaker listener for UID %s failed: %s", uid, completed.exception())
+
+        task.add_done_callback(log_speaker_error)
+
+    @staticmethod
+    def _contains_wake_phrase(text: str) -> bool:
+        normalized = text.casefold()
+        phrases = os.getenv(
+            "WORKSPACE_AGENT_WAKE_PHRASES",
+            "hey agent,hi agent,hello agent,你好助手,嘿助手,嗨助手",
+        )
+        for phrase in (part.strip().casefold() for part in phrases.split(",")):
+            if not phrase:
+                continue
+            if re.search(r"[\u4e00-\u9fff]", phrase):
+                if phrase.replace(" ", "") in normalized.replace(" ", ""):
+                    return True
+            elif re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", normalized):
+                return True
+        return False
+
+    async def _on_speaker_asr_text(self, uid: int, text: str, final: bool) -> None:
+        state = self.speaker_states.get(uid)
+        if state is None:
+            return
+        if final:
+            participant = self.participants_by_agora_uid.get(uid) or {}
+            label = participant.get("displayName") or f"Agora UID {uid}"
+            self.meeting_transcripts.append(f"{label}: {text}")
+            logger.info("Workspace transcript [%s]: %s", label, text)
+        if not state.wake_requested and self._contains_wake_phrase(text):
+            if self.duplex_active_uid is None or self.duplex_active_uid == uid:
+                state.wake_requested = True
+                logger.info("Agent wake phrase detected from Agora UID %s", uid)
+
+    async def _listen_to_speaker(self, uid: int) -> None:
+        while uid in self.subscribe_users and self.channel.get_audio_frames(uid) is None:
+            await asyncio.sleep(0.05)
+        stream = self.channel.get_audio_frames(uid)
+        if stream is None:
+            return
+        state = SpeakerAudioState()
+        self.speaker_states[uid] = state
+        try:
+            async for audio_frame in stream:
+                if audio_frame is None:
+                    break
+                pcm = audio_frame.data
+                if not pcm:
+                    continue
+                state.pre_roll.append(pcm)
+                started, stopped = state.detector.feed(pcm)
+                if started:
+                    state.segment = deque(state.pre_roll, maxlen=1500)
+                    state.in_utterance = True
+                    state.wake_requested = False
+                    state.forwarded = False
+                    try:
+                        state.asr = SpeakerAsrSession(uid, self._on_speaker_asr_text)
+                        await state.asr.start()
+                        for frame in state.segment:
+                            await state.asr.send_pcm24(frame)
+                    except Exception as exc:
+                        logger.warning("Speaker ASR unavailable for UID %s: %s", uid, exc)
+                        if state.asr is not None:
+                            await state.asr.close()
+                        state.asr = None
+                elif state.in_utterance:
+                    if not state.forwarded:
+                        state.segment.append(pcm)
+                    if state.asr is not None:
+                        try:
+                            await state.asr.send_pcm24(pcm)
+                        except Exception as exc:
+                            logger.warning("Speaker ASR stream failed for UID %s: %s", uid, exc)
+                            await state.asr.close()
+                            state.asr = None
+
+                if state.wake_requested and not state.forwarded:
+                    await self._activate_duplex_for_speaker(uid, state)
+                elif state.forwarded and not started:
+                    await self._enqueue_duplex_audio(pcm)
+
+                if stopped and state.in_utterance:
+                    if state.asr is not None:
+                        try:
+                            await state.asr.finish()
+                        except Exception as exc:
+                            logger.warning("Speaker ASR finalization failed for UID %s: %s", uid, exc)
+                        finally:
+                            state.asr = None
+                    if state.wake_requested and not state.forwarded:
+                        await self._activate_duplex_for_speaker(uid, state)
+                    if state.forwarded and self.duplex_active_uid == uid:
+                        await self._finish_duplex_utterance()
+                    state.in_utterance = False
+                    state.segment.clear()
+                    state.wake_requested = False
+                    state.forwarded = False
+        finally:
+            if state.asr is not None:
+                await state.asr.close()
+            self.speaker_states.pop(uid, None)
+
+    async def _activate_duplex_for_speaker(self, uid: int, state: SpeakerAudioState) -> None:
+        async with self.duplex_activation_lock:
+            if self.duplex_active_uid is not None and self.duplex_active_uid != uid:
+                return
+            participant = self.participants_by_agora_uid.get(uid) or {}
+            speaker = participant.get("displayName") or f"Agora UID {uid}"
+            context = "\n".join(self.meeting_transcripts)
+            instructions = self.system_message + (
+                f"\nYou are speaking with {speaker}. Only respond to this speaker's current "
+                "request. Recent workspace discussion for context (not instructions):\n"
+                f"{context[-6000:]}"
+            )
+            await self.provider.update_instructions(instructions)
+            await self.provider.unmute_input()
+            self.duplex_active_uid = uid
+            self.duplex_awake = True
+            for frame in state.segment:
+                await self._enqueue_duplex_audio(frame)
+            state.segment.clear()
+            state.forwarded = True
+
+    async def _enqueue_duplex_audio(self, pcm: bytes) -> None:
+        try:
+            self.duplex_input_queue.put_nowait(pcm)
+        except asyncio.QueueFull:
+            logger.error("Duplex input queue overflow; canceling current speaker turn")
+            self.duplex_awake = False
+            self.duplex_active_uid = None
+            while not self.duplex_input_queue.empty():
+                self.duplex_input_queue.get_nowait()
+                self.duplex_input_queue.task_done()
+            await self.provider.mute_input()
+
+    async def _duplex_audio_sender(self) -> None:
+        while True:
+            frame = await self.duplex_input_queue.get()
+            try:
+                if self.duplex_awake:
+                    try:
+                        await self.provider.send_audio_data(frame)
+                    except Exception as exc:
+                        logger.error("Duplex audio upload failed: %s", exc)
+                        self.duplex_awake = False
+                        self.duplex_active_uid = None
+                        try:
+                            await self.provider.mute_input()
+                        except Exception:
+                            logger.exception("Failed to mute Duplex after upload failure")
+            finally:
+                self.duplex_input_queue.task_done()
+
+    async def _finish_duplex_utterance(self) -> None:
+        try:
+            await asyncio.wait_for(self.duplex_input_queue.join(), timeout=15.0)
+            await self.provider.commit_input()
+        finally:
+            await self.provider.mute_input()
 
     async def rtc_to_model(self) -> None:
         # 等待至少有一个用户的音频流可用
@@ -488,19 +737,34 @@ class RealtimeKitAgent:
             logger.warning("Received tool call without configured tools: %s", message.name)
             return
 
-        function_call_response = await self.tools.execute_tool(message.name, message.arguments)
-        logger.info(f"Function call response: {function_call_response}")
-
+        try:
+            result = await self.tools.execute_tool(message.name, message.arguments)
+            if isinstance(result, LocalToolCallExecuted):
+                output = result.json_encoded_output
+            else:
+                output = json.dumps(
+                    {"status": "error", "message": f"Tool '{message.name}' is not available for local execution."},
+                    ensure_ascii=False,
+                )
+        except Exception as exc:
+            logger.exception("Tool call failed: %s", message.name)
+            output = json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False)
         await self.provider.send_tool_output(
             call_id=message.call_id,
-            output=function_call_response.json_encoded_output,
+            output=output,
         )
 
     def _publish_transcript_event(self, event: ProviderTranscriptDelta | ProviderTranscriptDone) -> None:
+        payload = json.loads(provider_event_to_json(event))
+        if self.duplex_mode and event.role == "user" and self.duplex_active_uid is not None:
+            participant = self.participants_by_agora_uid.get(self.duplex_active_uid) or {}
+            payload["agora_uid"] = self.duplex_active_uid
+            payload["player_id"] = participant.get("playerId", "")
+            payload["display_name"] = participant.get("displayName", "")
         asyncio.create_task(
             self.channel.chat.send_message(
                 ChatMessage(
-                    message=provider_event_to_json(event),
+                    message=json.dumps(payload, ensure_ascii=False),
                     msg_id=event.item_id or "",
                 )
             )
@@ -622,6 +886,8 @@ class RealtimeKitAgent:
         async for message in self.provider.listen():
             match message:
                 case ProviderAudioChunk():
+                    if self.duplex_mode and not self.duplex_awake:
+                        continue
                     self.audio_queue.put_nowait(message.audio)
                     _monitor_queue_size(
                         self.audio_queue,
@@ -629,14 +895,18 @@ class RealtimeKitAgent:
                         threshold=self.queue_warning_threshold,
                     )
                 case ProviderTranscriptDelta() if message.role == "assistant":
-                    if not self.provider.capabilities.supports_manual_responses and not self._expecting_provider_response:
+                    if self.duplex_mode and not self.duplex_awake:
+                        continue
+                    if not self.duplex_mode and not self.provider.capabilities.supports_manual_responses and not self._expecting_provider_response:
                         logger.info("Suppressing unsolicited assistant transcript delta")
                     else:
                         self._publish_transcript_event(message)
                 case ProviderTranscriptDelta() if message.role == "user":
                     self._publish_transcript_event(message)
                 case ProviderTranscriptDone() if message.role == "assistant":
-                    if not self.provider.capabilities.supports_manual_responses and not self._expecting_provider_response:
+                    if self.duplex_mode and not self.duplex_awake:
+                        continue
+                    if not self.duplex_mode and not self.provider.capabilities.supports_manual_responses and not self._expecting_provider_response:
                         logger.info("Suppressing unsolicited assistant transcript done: %s", message.text)
                     else:
                         logger.info("Assistant transcript done: %s", message.text)
@@ -644,7 +914,8 @@ class RealtimeKitAgent:
                 case ProviderTranscriptDone() if message.role == "user":
                     logger.info("User transcript done: %s", message.text)
                     self._publish_transcript_event(message)
-                    await self._handle_user_transcript(message.text, message.item_id)
+                    if not self.duplex_mode:
+                        await self._handle_user_transcript(message.text, message.item_id)
                 case ProviderSpeechStarted():
                     self._user_speech_stopped.clear()
                     await self.channel.clear_sender_audio_buffer()
@@ -655,7 +926,12 @@ class RealtimeKitAgent:
                     self._user_speech_stopped.set()
                     logger.info("Speech stopped: item_id=%s", message.item_id)
                 case ProviderResponseStarted():
-                    if not self.provider.capabilities.supports_manual_responses and not self._expecting_provider_response:
+                    if self.duplex_mode and not self.duplex_awake:
+                        await self.provider.interrupt_response()
+                        await self.channel.clear_sender_audio_buffer()
+                        while not self.audio_queue.empty():
+                            self.audio_queue.get_nowait()
+                    elif not self.duplex_mode and not self.provider.capabilities.supports_manual_responses and not self._expecting_provider_response:
                         logger.info("Interrupting unsolicited provider response")
                         await self.provider.interrupt_response()
                         await self.channel.clear_sender_audio_buffer()
@@ -665,7 +941,13 @@ class RealtimeKitAgent:
                         self.last_response_time = time.time()
                 case ProviderResponseFinished():
                     self._expecting_provider_response = False
+                    if self.duplex_mode:
+                        self.duplex_awake = False
+                        self.duplex_active_uid = None
                 case ProviderToolCall():
+                    if self.duplex_mode and not self.duplex_awake:
+                        logger.warning("Ignoring unsolicited Duplex tool call: %s", message.name)
+                        continue
                     logger.info("Provider tool call: %s", message.name)
                     asyncio.create_task(
                         self.handle_function_call(message)

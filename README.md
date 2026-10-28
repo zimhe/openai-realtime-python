@@ -46,6 +46,65 @@ Before running the demo, ensure you have the following installed and configured:
 
 ## Run the Demo
 
+### Workspace agent with Seeduplex 3.0
+
+The workspace voice path can use `REALTIME_PROVIDER=volcengine_duplex` without
+changing the Agora channel or the existing `/start` and `/stop` endpoints. It
+receives each participant's Agora audio separately, uses a short-lived SAUC ASR
+stream to detect a wake phrase and collect meeting context, and forwards only
+the addressed speaker's audio to Seeduplex. Until a wake phrase is recognized,
+the Seeduplex input is explicitly muted. The default wake phrases are
+`hey agent`, `hi agent`, `hello agent`, `你好助手`, `嘿助手`, and `嗨助手`.
+
+Enable **Seeduplex 3.0 full duplex realtime voice** and **Streaming ASR 2.0
+(SAUC, hourly)** in the same Volcengine project. Create an API key for that
+project. In the Render service environment, set:
+
+```env
+REALTIME_PROVIDER=volcengine_duplex
+VOLCENGINE_API_KEY=<secret API key>
+VOLCENGINE_ASR_RESOURCE_ID=volc.seedasr.sauc.duration
+WORKSPACE_AGENT_WAKE_PHRASES=hey agent,hi agent,hello agent,你好助手,嘿助手,嗨助手
+```
+
+`VOLCENGINE_ASR_RESOURCE_ID` and `WORKSPACE_AGENT_WAKE_PHRASES` are optional;
+the values shown are the defaults. Keep the existing Agora credentials. If
+the ASR service uses legacy app credentials, set `VOLCENGINE_APP_ID` and
+`VOLCENGINE_ACCESS_KEY` for ASR instead; Seeduplex still requires
+`VOLCENGINE_API_KEY`. The current mixed-audio provider remains available with
+`REALTIME_PROVIDER=volcengine_split`.
+
+### Streamoji authentication relay
+
+The Unity client now calls this service's `POST /streamoji/auth-token` instead
+of the Streamoji Firebase function. The request body contains `userId` and
+`userName` and must include `Authorization: Bearer <Unity Authentication access
+token>`. The backend verifies that the bearer belongs to `userId`, then sends
+the request to Streamoji with server-side credentials. Configure these Render
+environment variables:
+
+```env
+UNITY_PROJECT_ID=<existing Unity project ID>
+STREAMOJI_CLIENT_ID=<Streamoji client ID>
+STREAMOJI_CLIENT_SECRET=<Streamoji client secret>
+```
+
+Do not put the Streamoji secret in Unity assets or client builds. The legacy
+Unity Editor-only avatar config fetch tool reads the same two Streamoji
+variables from the Editor process environment; that tool still reaches
+Streamoji directly. Rotate any credentials previously stored in a tracked
+`Resources/SMJApiConfig.asset`, because deleting them from the current asset
+does not erase Git history.
+
+Rebuild and deploy this backend and rebuild the Unity client containing the
+Agora identity handshake. For a smoke test, join the workspace with two
+clients, start the agent, speak without the wake phrase, then say “hey agent”
+and a question from one client. Confirm that only that client's voice is sent
+to Seeduplex and that the transcript carries its Agora UID. Meeting transcript
+context is currently kept in process memory only. The identity message is
+client-reported and must not be used for authorization until validated against
+a server-signed roster.
+
 ### Setup and run the backend
 
 1. Create a `.env` file for the backend. Copy `.env.example` to `.env` in the root of the repo and fill in the required values:
