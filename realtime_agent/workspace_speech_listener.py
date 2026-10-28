@@ -33,9 +33,9 @@ class EnergySpeechDetector:
     def __init__(
         self,
         *,
-        min_rms: float = 350.0,
-        onset_ms: float = 60.0,
-        release_ms: float = 800.0,
+        min_rms: float = 250.0,
+        onset_ms: float = 40.0,
+        release_ms: float = 900.0,
     ):
         self.min_rms = min_rms
         self.onset_ms = onset_ms
