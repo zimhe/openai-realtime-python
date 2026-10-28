@@ -13,12 +13,9 @@ from openai import OpenAI
 from .tools import LocalToolCallExecuted, ToolContext
 
 
-<<<<<<< HEAD
 logger = logging.getLogger(__name__)
 
 
-=======
->>>>>>> origin/codex/token-service-consolidation
 def preferred_address_name(display_name: str | None) -> str | None:
     """Use the first word of a trusted participant display label for casual address."""
     normalized = " ".join((display_name or "").split())
@@ -30,7 +27,6 @@ def preferred_address_name(display_name: str | None) -> str | None:
     return first
 
 
-<<<<<<< HEAD
 def allowed_image_tools(text: str) -> set[str]:
     """Only expose image actions when the current message explicitly requests one."""
     if re.search(r"(?i)(?:/imagine\b|\b(?:generate|create|draw|make|render|paint)\b.{0,35}\b(?:image|picture|illustration|photo|visual)\b|\b(?:image|picture|photo)\b.{0,25}\b(?:generate|create|draw|edit|refine|modify)\b|(?:生成|画|绘制|创作|制作).{0,12}(?:图片|图像|插画|画|图)|(?:把|将).{0,20}(?:图片|图像|照片).{0,12}(?:编辑|修改|重绘))", text):
@@ -40,8 +36,6 @@ def allowed_image_tools(text: str) -> set[str]:
     return set()
 
 
-=======
->>>>>>> origin/codex/token-service-consolidation
 class WorkspaceTextAgent:
     def __init__(self, tools: ToolContext, system_message: str = "") -> None:
         self.tools = tools
