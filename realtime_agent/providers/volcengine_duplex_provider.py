@@ -129,10 +129,18 @@ class VolcengineDuplexRealtimeProvider(RealtimeProviderConnection):
         }
         if tools:
             session_payload["tools"] = tools.model_description()
+        extension: dict[str, Any] = {"asr": {}, "tts": {}, "dialog": {}}
+        search_key = os.getenv("VOLCENGINE_WEBSEARCH_API_KEY", "").strip()
+        if search_key:
+            extension["dialog"]["extra"] = {
+                "enable_volc_websearch": True,
+                "volc_websearch_type": os.getenv("VOLCENGINE_WEBSEARCH_TYPE", "web_global_api"),
+                "volc_websearch_api_key": search_key,
+            }
         await self._send(
             "session.create",
             session=session_payload,
-            extension={"asr": {}, "tts": {}, "dialog": {}},
+            extension=extension,
         )
         while True:
             event = await self._receive()

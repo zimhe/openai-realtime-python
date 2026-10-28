@@ -34,6 +34,7 @@ from .providers import (
     provider_event_to_json,
 )
 from .realtime.agent_functions import AgentToolsMetaWorkplaces
+from .workspace_text_agent import WorkspaceTextAgent
 from .tools import ClientToolCallResponse, LocalToolCallExecuted, ToolContext
 from .utils import PCMWriter
 
@@ -296,6 +297,9 @@ class RealtimeKitAgent:
         self.channel = channel
         self.system_message = system_message or ""
         self.duplex_mode = provider.provider_name == "volcengine_duplex"
+        self.workspace_text_agent = None
+        if self.duplex_mode and tools is not None and os.getenv("ARK_API_KEY"):
+            self.workspace_text_agent = WorkspaceTextAgent(tools, self.system_message)
         self.audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self.subscribe_users = set()
         self.participants_by_agora_uid: dict[int, dict[str, str]] = {}
@@ -460,6 +464,48 @@ class RealtimeKitAgent:
                     logger.info("Bound Agora UID %s to workspace participant %s", user_id, player_id)
                 return
 
+            if text.startswith("workspace.screen.selection:"):
+                payload = json.loads(text[len("workspace.screen.selection:"):])
+                if isinstance(self.tools, AgentToolsMetaWorkplaces):
+                    self.tools.set_selected_screen(int(user_id), str(payload.get("screenKey") or ""))
+                return
+
+            if text.startswith("workspace.agent.text.request:"):
+                payload = json.loads(text[len("workspace.agent.text.request:"):])
+                if not isinstance(payload, dict):
+                    return
+                request_id = str(payload.get("requestId") or "")[:128]
+                question = str(payload.get("text") or "").strip()[:8000]
+                image_url = str(payload.get("imageUrl") or "").strip() or None
+                selected_key = str(payload.get("selectedScreenKey") or "").strip()
+                if not request_id or not question or (image_url and not image_url.startswith("https://")):
+                    return
+                if not self.workspace_text_agent:
+                    await self._send_workspace_text_response(request_id, int(user_id),
+                                                             "文字与图片理解服务未配置 ARK_API_KEY。")
+                    return
+                if isinstance(self.tools, AgentToolsMetaWorkplaces):
+                    if selected_key and selected_key not in (self.tools.screen_keys or []):
+                        selected_key = ""
+                    token = self.tools.request_screen_key.set(selected_key or None)
+                else:
+                    token = None
+                try:
+                    participant = self.participants_by_agora_uid.get(int(user_id)) or {}
+                    answer = await self.workspace_text_agent.respond(
+                        question, image_url, participant.get("displayName") or str(user_id),
+                        "\n".join(self.meeting_transcripts),
+                    )
+                    await self._send_workspace_text_response(request_id, int(user_id), answer)
+                except Exception:
+                    logger.exception("Workspace text request failed")
+                    await self._send_workspace_text_response(request_id, int(user_id),
+                                                             "文字请求暂时失败，请稍后重试。")
+                finally:
+                    if token is not None:
+                        self.tools.request_screen_key.reset(token)
+                return
+
             if self.require_explicit_trigger and not self.provider.capabilities.supports_manual_responses:
                 current_time = time.time()
                 if self.MENTION_PATTERN in text:
@@ -475,6 +521,13 @@ class RealtimeKitAgent:
                 await self.provider.request_response()
         except Exception as e:
             logger.error(f"Error Sending stream message: {e}")
+
+    async def _send_workspace_text_response(self, request_id: str, user_id: int, answer: str) -> None:
+        response = {"type": "workspace.agent.text.response", "request_id": request_id,
+                    "item_id": uuid.uuid4().hex, "agora_uid": user_id, "text": answer}
+        await self.channel.chat.send_message(
+            ChatMessage(message=json.dumps(response, ensure_ascii=False), msg_id=response["item_id"])
+        )
 
     async def _request_participant_identities(self) -> None:
         await self.channel.chat.send_message(

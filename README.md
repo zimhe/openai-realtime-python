@@ -63,6 +63,10 @@ project. In the Render service environment, set:
 ```env
 REALTIME_PROVIDER=volcengine_duplex
 VOLCENGINE_API_KEY=<secret API key>
+ARK_API_KEY=<Ark API key for the chat/vision model and Seedream>
+ARK_CHAT_MODEL=doubao-seed-2-1-lite-260915
+VOLCENGINE_WEBSEARCH_API_KEY=<Fusion Information Search API key>
+VOLCENGINE_WEBSEARCH_TYPE=web_global_api
 VOLCENGINE_ASR_RESOURCE_ID=volc.seedasr.sauc.duration
 WORKSPACE_AGENT_WAKE_PHRASES=hey agent,hi agent,hello agent,你好助手,嘿助手,嗨助手
 ```
@@ -73,6 +77,15 @@ the ASR service uses legacy app credentials, set `VOLCENGINE_APP_ID` and
 `VOLCENGINE_ACCESS_KEY` for ASR instead; Seeduplex still requires
 `VOLCENGINE_API_KEY`. The current mixed-audio provider remains available with
 `REALTIME_PROVIDER=volcengine_split`.
+
+Workspace `@agent` text and attached-image questions use the separate Ark
+chat/vision model configured by `ARK_CHAT_MODEL`; the voice session continues
+through Seeduplex. Seedream remains the image-generation backend. The Duplex
+web-search extension is enabled only when `VOLCENGINE_WEBSEARCH_API_KEY` is
+set. Use the search service's own key, not the Ark or Duplex key. Set
+`VOLCENGINE_WEBSEARCH_TYPE` to the product enabled for that key; `web_global_api`
+is the default for full duplex. Restart or redeploy the Render service after
+changing these values.
 
 ### Streamoji authentication relay
 

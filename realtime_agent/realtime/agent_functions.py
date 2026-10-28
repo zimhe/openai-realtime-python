@@ -14,10 +14,9 @@ import uuid
 import json
 import aiohttp
 import os
+from contextvars import ContextVar
 from openai import OpenAI
 
-aliyun_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
-aliyun_model_id="qwen2.5-vl-7b-instruct"
 ark_image_url = os.environ.get("ARK_IMAGE_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
 ark_image_model_id = os.environ.get("ARK_IMAGE_MODEL_ID", "doubao-seedream-5-0-lite-260128")
 ark_image_size = os.environ.get("ARK_IMAGE_SIZE", "2K")
@@ -38,13 +37,10 @@ class AgentToolsMetaWorkplaces(ToolContext):
         self.agent=None
         self.channel=None
         self.screen_keys=None
-        self.openai_client=OpenAI()
+        self.selected_screen_by_uid={}
+        self.request_screen_key: ContextVar[str | None] = ContextVar("request_screen_key", default=None)
         self.history_images={}
         self.t2i_condition_queue=asyncio.Queue()
-        self.aliyun_client=OpenAI(
-            base_url=aliyun_url,
-            api_key=os.environ.get("ALIYUN_API_KEY")
-            )
         
 
         self.register_function(
@@ -176,7 +172,27 @@ class AgentToolsMetaWorkplaces(ToolContext):
         self.channel=agent.channel
         
     def set_screen_context(self,screen_keys):
-        self.screen_keys=screen_keys
+        self.screen_keys=sorted(set(screen_keys or []))
+
+    def set_selected_screen(self, uid: int, key: str | None):
+        if key and key in (self.screen_keys or []):
+            self.selected_screen_by_uid[uid] = key
+        else:
+            self.selected_screen_by_uid.pop(uid, None)
+
+    def resolve_screen_key(self, screen_id: int) -> str | None:
+        if screen_id == -1:
+            return None
+        if screen_id == -2:
+            key = self.request_screen_key.get()
+            if not key and self.agent is not None:
+                key = self.selected_screen_by_uid.get(getattr(self.agent, "duplex_active_uid", None))
+            if not key or key not in (self.screen_keys or []):
+                raise ValueError("No valid selected screen is registered for the requesting user")
+            return key
+        if screen_id < 1 or screen_id > len(self.screen_keys or []):
+            raise ValueError(f"Screen {screen_id} is not registered")
+        return self.screen_keys[screen_id - 1]
         
     
     def format_t2i_result(self, output, screen_key,item_id):
@@ -193,13 +209,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
             if not output:
                 raise RuntimeError("Seedream did not return an image URL")
             
-            screen_key=None
-            proper_screen_id=screen_id-1
-            
-            if screen_id==-2:
-                screen_key="selected"
-            elif screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
-                screen_key=self.screen_keys[proper_screen_id]
+            screen_key=self.resolve_screen_key(screen_id)
             
             msg_id=uuid.uuid4().hex
             
@@ -231,13 +241,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
                 raise RuntimeError("Seedream did not return an image URL")
             
 
-            screen_key=None
-            proper_screen_id=screen_id-1
-            
-            if screen_id==-2:
-                screen_key="selected"
-            elif screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
-                screen_key=self.screen_keys[proper_screen_id]
+            screen_key=self.resolve_screen_key(screen_id)
             
             
             msg_id=uuid.uuid4().hex
@@ -270,13 +274,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
             if not output:
                 raise RuntimeError("Volcengine visual inpaint did not return an image URL")
 
-            screen_key=None
-            proper_screen_id=screen_id-1
-
-            if screen_id==-2:
-                screen_key="selected"
-            elif screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
-                screen_key=self.screen_keys[proper_screen_id]
+            screen_key=self.resolve_screen_key(screen_id)
 
             msg_id=uuid.uuid4().hex
 
@@ -539,10 +537,7 @@ class AgentToolsMetaWorkplaces(ToolContext):
             
     async def _cast_image_to_screen(self,image_url,screen_id=1)-> dict[str, Any]:
         try:
-            screen_key=None
-            proper_screen_id=screen_id-1
-            if screen_id!=-1 and self.screen_keys is not None and proper_screen_id<len(self.screen_keys):
-                screen_key=self.screen_keys[proper_screen_id]
+            screen_key=self.resolve_screen_key(screen_id)
             
             msg_id=uuid.uuid4().hex
             
@@ -562,75 +557,3 @@ class AgentToolsMetaWorkplaces(ToolContext):
                 "status": "error",
                 "message": f"Failed to cast image to screen, {e}",
             }
-           
-            
-    async def _get_web_search_results(self,query: str) -> dict[str, Any]:
-        """
-        本地函数: 通过 OpenAI 的 gpt-4o-search-preview 执行网络搜索
-        """
-        try:
-            response = self.openai_client.chat.completions.create(
-                model="gpt-4o-search-preview",
-                # web_search_options={
-                #     "search_context_size": "low",  # 设定搜索范围
-                # },
-                messages=[{
-                    "role": "user",
-                    "content": query,
-                }],
-            )
-
-            # 解析返回结果
-            result_text = response.choices[0].message.content if response.choices else "No results found"
-
-            return {
-                "status": "success",
-                "message": f"Search results for '{query}': {result_text}",
-                "result": result_text,
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to fetch search results: {str(e)}",
-            }
-    async def _interpert_image(self,image_url:str,query: str) -> dict[str, Any]:
-        message={
-            "role": "user",
-            "content":[
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": image_url,
-                    }
-                },
-                {
-                    "type": "text",
-                    "text": query,
-                }
-            ]
-        }
-         
-        try:
-            completion = self.aliyun_client.chat.completions.create(
-                model=aliyun_model_id,
-                stream=False,
-                max_tokens=512,
-                temperature=0.7,
-                messages=[message]
-            )
-            
-            data = json.loads(completion.model_dump_json())
-            result = data["choices"][0]["message"]["content"]
-            
-            return {
-                "status": "success",
-                "message": f"Image interpertation for '{query}': {result}",
-                "result": result,
-            }
-
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to interpret image: {str(e)}",
-            }
-         
