@@ -585,7 +585,7 @@ class RealtimeKitAgent:
         }
 
     def _duplex_window_open(self) -> bool:
-        return time.monotonic() < self.duplex_active_until
+        return self.duplex_active_uid is not None or time.monotonic() < self.duplex_active_until
 
     async def _close_duplex_window(self) -> None:
         self.duplex_active_until = 0.0
@@ -627,8 +627,10 @@ class RealtimeKitAgent:
                 logger.info("Agent stop phrase detected from Agora UID %s", uid)
                 await self._close_duplex_window()
                 return
-        if self._contains_wake_phrase(text):
-            self.duplex_active_until = time.monotonic() + self.ACTIVE_WINDOW_SECONDS
+        if not self._duplex_window_open() and self._contains_wake_phrase(text):
+            # The 20-second silence window starts after the reply. Give the
+            # initial wake-up a bounded grace period in case no reply arrives.
+            self.duplex_active_until = time.monotonic() + 60.0
             self.duplex_first_reply_pending = True
             logger.info("Agent wake phrase detected from Agora UID %s", uid)
         if not state.wake_requested and self._duplex_window_open():
@@ -656,6 +658,11 @@ class RealtimeKitAgent:
                     state.in_utterance = True
                     state.wake_requested = False
                     state.forwarded = False
+                    # Keep per-speaker ASR running for attributed meeting captions.
+                    # During the active window, start forwarding audio to Duplex
+                    # at VAD onset rather than waiting for an ASR result.
+                    if self._duplex_window_open():
+                        state.wake_requested = True
                     try:
                         state.asr = SpeakerAsrSession(uid, self._on_speaker_asr_text)
                         await state.asr.start()
@@ -733,7 +740,6 @@ class RealtimeKitAgent:
             state.segment.clear()
             state.forwarded = True
             self.duplex_first_reply_pending = False
-            self.duplex_active_until = time.monotonic() + self.ACTIVE_WINDOW_SECONDS
             return True
 
     async def _enqueue_duplex_audio(self, pcm: bytes) -> None:
@@ -750,6 +756,8 @@ class RealtimeKitAgent:
 
     async def _resume_pending_duplex_utterance(self) -> None:
         while self.duplex_pending_utterances and self._duplex_window_open():
+            if self.duplex_active_uid is not None:
+                return
             uid, frames = self.duplex_pending_utterances.popleft()
             if uid not in self.subscribe_users or not frames:
                 continue
@@ -757,6 +765,8 @@ class RealtimeKitAgent:
             state.segment = deque(frames, maxlen=1500)
             if await self._activate_duplex_for_speaker(uid, state):
                 await self._finish_duplex_utterance()
+            else:
+                self.duplex_pending_utterances.appendleft((uid, frames))
             break
 
     async def _duplex_audio_sender(self) -> None:
@@ -1056,7 +1066,6 @@ class RealtimeKitAgent:
                     logger.info("User transcript done: %s", message.text)
                     if not self.duplex_mode:
                         self._publish_transcript_event(message)
-                    if not self.duplex_mode:
                         await self._handle_user_transcript(message.text, message.item_id)
                 case ProviderSpeechStarted():
                     self._user_speech_stopped.clear()
@@ -1084,6 +1093,9 @@ class RealtimeKitAgent:
                 case ProviderResponseFinished():
                     self._expecting_provider_response = False
                     if self.duplex_mode:
+                        if self.duplex_awake and self.duplex_active_uid is not None:
+                            self.duplex_active_until = time.monotonic() + self.ACTIVE_WINDOW_SECONDS
+                            logger.info("Duplex reply finished; shared %ss response window started", self.ACTIVE_WINDOW_SECONDS)
                         self.duplex_awake = False
                         self.duplex_active_uid = None
                         if self.duplex_pending_utterances and self._duplex_window_open():
