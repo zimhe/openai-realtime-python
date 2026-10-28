@@ -9,6 +9,7 @@ from realtime_agent.tools import ToolContext
 
 DEFAULT_OPENAI_VOICE = "marin"
 DEFAULT_VOLCENGINE_VOICE = "zh_female_vv_jupiter_bigtts"
+DEFAULT_DUPLEX_VOICE = "zh_female_xiaohe_jupiter_bigtts"
 OPENAI_REALTIME_VOICES = {
     "alloy",
     "echo",
