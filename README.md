@@ -68,15 +68,20 @@ ARK_CHAT_MODEL=doubao-seed-2-1-lite-260915
 VOLCENGINE_WEBSEARCH_API_KEY=<Fusion Information Search API key>
 VOLCENGINE_WEBSEARCH_TYPE=web_global_api
 VOLCENGINE_ASR_RESOURCE_ID=volc.seedasr.sauc.duration
+VOLCENGINE_ASR_API_KEY=<optional speech-service API key>
 WORKSPACE_AGENT_WAKE_PHRASES=hey agent,hi agent,hello agent,你好助手,嘿助手,嗨助手
 ```
 
 `VOLCENGINE_ASR_RESOURCE_ID` and `WORKSPACE_AGENT_WAKE_PHRASES` are optional;
 the values shown are the defaults. Keep the existing Agora credentials. If
-the ASR service uses legacy app credentials, set `VOLCENGINE_APP_ID` and
-`VOLCENGINE_ACCESS_KEY` for ASR instead; Seeduplex still requires
+the ASR service uses legacy app credentials, set `VOLCENGINE_APP_ID`,
+`VOLCENGINE_ACCESS_KEY`, and `VOLCENGINE_ASR_AUTH_MODE=legacy` for ASR instead;
+Seeduplex still requires
 `VOLCENGINE_API_KEY`. The current mixed-audio provider remains available with
 `REALTIME_PROVIDER=volcengine_split`.
+`VOLCENGINE_ASR_API_KEY` overrides `VOLCENGINE_API_KEY` for the per-speaker
+ASR connection when the speech service uses a different API key. The selected
+`VOLCENGINE_ASR_RESOURCE_ID` must be active on that key's speech account.
 
 Workspace `@agent` text and attached-image questions use the separate Ark
 chat/vision model configured by `ARK_CHAT_MODEL`; the voice session continues
