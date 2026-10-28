@@ -220,6 +220,7 @@ class SpeakerAudioState:
     segment: deque[bytes] = field(default_factory=lambda: deque(maxlen=1500))
     asr: SpeakerAsrSession | None = None
     wake_requested: bool = False
+    started_in_active_window: bool = False
     forwarded: bool = False
     in_utterance: bool = False
 
@@ -657,11 +658,12 @@ class RealtimeKitAgent:
                     state.segment = deque(state.pre_roll, maxlen=1500)
                     state.in_utterance = True
                     state.wake_requested = False
+                    state.started_in_active_window = self._duplex_window_open()
                     state.forwarded = False
                     # Keep per-speaker ASR running for attributed meeting captions.
                     # During the active window, start forwarding audio to Duplex
                     # at VAD onset rather than waiting for an ASR result.
-                    if self._duplex_window_open():
+                    if state.started_in_active_window:
                         state.wake_requested = True
                     try:
                         state.asr = SpeakerAsrSession(uid, self._on_speaker_asr_text)
@@ -714,7 +716,7 @@ class RealtimeKitAgent:
 
     async def _activate_duplex_for_speaker(self, uid: int, state: SpeakerAudioState) -> bool:
         async with self.duplex_activation_lock:
-            if not self._duplex_window_open() or self.duplex_active_uid is not None:
+            if not (self._duplex_window_open() or state.started_in_active_window) or self.duplex_active_uid is not None:
                 return False
             participant = self.participants_by_agora_uid.get(int(uid)) or {}
             speaker = participant.get("displayName") or ""
