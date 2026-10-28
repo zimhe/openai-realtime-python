@@ -863,11 +863,11 @@ class RealtimeKitAgent:
         logger.info("[DuplexTrace] turn_commit_fallback turn=%s uid=%s queued_frames=%s", self.duplex_turn_id, uid, self.duplex_audio_frames_queued)
         await self._finish_duplex_utterance()
 
-    async def _watch_duplex_turn(self, uid: int) -> None:
+    async def _watch_duplex_turn(self, uid: int, timeout_seconds: int = 45) -> None:
         try:
-            await asyncio.sleep(45)
+            await asyncio.sleep(timeout_seconds)
             if self.duplex_active_uid == uid:
-                logger.warning("[DuplexTrace] turn_watchdog_timeout turn=%s uid=%s queued_frames=%s sent_frames=%s", self.duplex_turn_id, uid, self.duplex_audio_frames_queued, self.duplex_audio_frames_sent)
+                logger.warning("[DuplexTrace] turn_watchdog_timeout turn=%s uid=%s after_s=%s queued_frames=%s sent_frames=%s", self.duplex_turn_id, uid, timeout_seconds, self.duplex_audio_frames_queued, self.duplex_audio_frames_sent)
                 retry = None
                 if (self.duplex_wake_while_busy_uid is not None and
                         time.monotonic() - self.duplex_wake_while_busy_at < 20.0):
@@ -1030,6 +1030,15 @@ class RealtimeKitAgent:
             logger.warning("Received tool call without configured tools: %s", message.name)
             return
 
+        tool_turn_uid = self.duplex_active_uid if self.duplex_mode else None
+        if tool_turn_uid is not None:
+            if self.duplex_turn_watchdog is not None:
+                self.duplex_turn_watchdog.cancel()
+            self.duplex_turn_watchdog = asyncio.create_task(
+                self._watch_duplex_turn(tool_turn_uid, timeout_seconds=120)
+            )
+            logger.info("[DuplexTrace] tool_started turn=%s uid=%s tool=%s watchdog_s=120", self.duplex_turn_id, tool_turn_uid, message.name)
+
         if message.name in {"text_to_image", "refine_this_image", "refine_image_with_mask"}:
             notice_id = uuid.uuid4().hex
             notice = {
@@ -1057,10 +1066,17 @@ class RealtimeKitAgent:
         except Exception as exc:
             logger.exception("Tool call failed: %s", message.name)
             output = json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False)
-        await self.provider.send_tool_output(
-            call_id=message.call_id,
-            output=output,
-        )
+        try:
+            await self.provider.send_tool_output(
+                call_id=message.call_id,
+                output=output,
+            )
+        finally:
+            if tool_turn_uid is not None and self.duplex_active_uid == tool_turn_uid:
+                if self.duplex_turn_watchdog is not None:
+                    self.duplex_turn_watchdog.cancel()
+                self.duplex_turn_watchdog = asyncio.create_task(self._watch_duplex_turn(tool_turn_uid))
+                logger.info("[DuplexTrace] tool_finished turn=%s uid=%s tool=%s watchdog_s=45", self.duplex_turn_id, tool_turn_uid, message.name)
 
     def _publish_transcript_event(self, event: ProviderTranscriptDelta | ProviderTranscriptDone) -> None:
         payload = json.loads(provider_event_to_json(event))
