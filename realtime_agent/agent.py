@@ -223,6 +223,7 @@ class SpeakerAudioState:
     started_in_active_window: bool = False
     forwarded: bool = False
     in_utterance: bool = False
+    turn_committed: bool = False
 
 
 class RealtimeKitAgent:
@@ -316,6 +317,7 @@ class RealtimeKitAgent:
         self.duplex_activation_lock = asyncio.Lock()
         self.duplex_input_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=500)
         self.duplex_sender_task: asyncio.Task[None] | None = None
+        self.duplex_turn_watchdog: asyncio.Task[None] | None = None
         self.write_pcm = os.environ.get("WRITE_AGENT_PCM", "false") == "true"
         logger.info(f"Write PCM: {self.write_pcm}")
         self.last_trigger_time = 0
@@ -400,6 +402,9 @@ class RealtimeKitAgent:
                 if speaker_task is not None:
                     speaker_task.cancel()
                 if self.duplex_mode and self.duplex_active_uid == user_id:
+                    if self.duplex_turn_watchdog is not None:
+                        self.duplex_turn_watchdog.cancel()
+                        self.duplex_turn_watchdog = None
                     self.duplex_awake = False
                     self.duplex_active_uid = None
                     while not self.duplex_input_queue.empty():
@@ -450,6 +455,9 @@ class RealtimeKitAgent:
                 task.cancel()
             if self.duplex_sender_task is not None:
                 self.duplex_sender_task.cancel()
+            if self.duplex_turn_watchdog is not None:
+                self.duplex_turn_watchdog.cancel()
+                self.duplex_turn_watchdog = None
 
     async def _process_stream_message(self, user_id, stream_id, data, length) -> None:
         try:
@@ -589,6 +597,9 @@ class RealtimeKitAgent:
         return self.duplex_active_uid is not None or time.monotonic() < self.duplex_active_until
 
     async def _close_duplex_window(self) -> None:
+        if self.duplex_turn_watchdog is not None and self.duplex_turn_watchdog is not asyncio.current_task():
+            self.duplex_turn_watchdog.cancel()
+        self.duplex_turn_watchdog = None
         self.duplex_active_until = 0.0
         self.duplex_first_reply_pending = False
         self.duplex_pending_utterances.clear()
@@ -625,6 +636,8 @@ class RealtimeKitAgent:
             if should_stop:
                 logger.info("Agent stop phrase detected from Agora UID %s", uid)
                 await self._close_duplex_window()
+            elif state.forwarded and state.in_utterance and not state.turn_committed and self.duplex_active_uid == uid:
+                asyncio.create_task(self._commit_turn_after_asr_final(uid, state))
             item_id = uuid.uuid4().hex
             payload = {
                 "type": "conversation.item.input_audio_transcription.completed",
@@ -673,7 +686,9 @@ class RealtimeKitAgent:
                     state.in_utterance = True
                     state.wake_requested = False
                     state.started_in_active_window = self._duplex_window_open()
+                    logger.info("Speaker VAD started: uid=%s active_window=%s", uid, state.started_in_active_window)
                     state.forwarded = False
+                    state.turn_committed = False
                     # Keep per-speaker ASR running for attributed meeting captions.
                     # During the active window, start forwarding audio to Duplex
                     # at VAD onset rather than waiting for an ASR result.
@@ -706,6 +721,7 @@ class RealtimeKitAgent:
                     await self._enqueue_duplex_audio(pcm)
 
                 if stopped and state.in_utterance:
+                    logger.info("Speaker VAD stopped: uid=%s forwarded=%s", uid, state.forwarded)
                     if state.asr is not None:
                         try:
                             await state.asr.finish()
@@ -718,6 +734,8 @@ class RealtimeKitAgent:
                         if not activated and self._duplex_window_open():
                             self.duplex_pending_utterances.append((uid, list(state.segment)))
                     if state.forwarded and self.duplex_active_uid == uid:
+                        state.turn_committed = True
+                        state.forwarded = False
                         await self._finish_duplex_utterance()
                     state.in_utterance = False
                     state.segment.clear()
@@ -751,12 +769,44 @@ class RealtimeKitAgent:
             await self.provider.unmute_input()
             self.duplex_active_uid = uid
             self.duplex_awake = True
+            if self.duplex_turn_watchdog is not None:
+                self.duplex_turn_watchdog.cancel()
+            self.duplex_turn_watchdog = asyncio.create_task(self._watch_duplex_turn(uid))
+            logger.info("Duplex turn activated for Agora UID %s", uid)
             for frame in state.segment:
                 await self._enqueue_duplex_audio(frame)
             state.segment.clear()
             state.forwarded = True
             self.duplex_first_reply_pending = False
             return True
+
+    async def _commit_turn_after_asr_final(self, uid: int, state: SpeakerAudioState) -> None:
+        # The independent ASR can end an utterance even when noise prevents the
+        # energy VAD from reaching its silence threshold.
+        await asyncio.sleep(0.35)
+        if (self.duplex_active_uid != uid or not state.in_utterance or
+                not state.forwarded or state.turn_committed):
+            return
+        state.turn_committed = True
+        state.forwarded = False
+        state.in_utterance = False
+        state.wake_requested = False
+        state.segment.clear()
+        state.detector = EnergySpeechDetector()
+        if state.asr is not None:
+            await state.asr.close()
+            state.asr = None
+        logger.info("Committing Duplex turn for Agora UID %s after ASR final", uid)
+        await self._finish_duplex_utterance()
+
+    async def _watch_duplex_turn(self, uid: int) -> None:
+        try:
+            await asyncio.sleep(45)
+            if self.duplex_active_uid == uid:
+                logger.warning("Duplex turn for Agora UID %s produced no completed response within 45s; resetting", uid)
+                await self._close_duplex_window()
+        except asyncio.CancelledError:
+            return
 
     async def _enqueue_duplex_audio(self, pcm: bytes) -> None:
         try:
@@ -808,6 +858,7 @@ class RealtimeKitAgent:
             await asyncio.wait_for(self.duplex_input_queue.join(), timeout=15.0)
             if self.duplex_awake:
                 await self.provider.commit_input()
+                logger.info("Duplex input committed for Agora UID %s", self.duplex_active_uid)
         finally:
             await self.provider.mute_input()
 
@@ -1109,6 +1160,9 @@ class RealtimeKitAgent:
                 case ProviderResponseFinished():
                     self._expecting_provider_response = False
                     if self.duplex_mode:
+                        if self.duplex_turn_watchdog is not None:
+                            self.duplex_turn_watchdog.cancel()
+                            self.duplex_turn_watchdog = None
                         if self.duplex_awake and self.duplex_active_uid is not None:
                             self.duplex_active_until = time.monotonic() + self.ACTIVE_WINDOW_SECONDS
                             logger.info("Duplex reply finished; shared %ss response window started", self.ACTIVE_WINDOW_SECONDS)
