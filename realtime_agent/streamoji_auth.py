@@ -165,12 +165,31 @@ async def proxy_streamoji_avatar(request: web.Request) -> web.Response:
         async with session.request(method, url, params={"avatarId": avatar_id} if avatar_id else None,
                                    data=body, headers=headers, allow_redirects=False) as response:
             result = await response.read()
+            saved_match = "unknown"
+            if action == "config" and response.status == 404:
+                try:
+                    saved_url = f"{_STREAMOJI_FUNCTION_BASE}/getSavedAvatarsForUser"
+                    async with session.get(saved_url, headers=headers, allow_redirects=False) as saved_response:
+                        if saved_response.status == 200:
+                            saved_payload = await saved_response.json(content_type=None)
+                            saved_data = saved_payload.get("data") if isinstance(saved_payload, dict) else None
+                            saved_ids = saved_data.get("avatarIds") if isinstance(saved_data, dict) else None
+                            if isinstance(saved_ids, list):
+                                saved_match = "true" if avatar_id in saved_ids else "false"
+                        else:
+                            _LOG.warning("Streamoji saved-avatar diagnostic returned HTTP %s",
+                                         saved_response.status)
+                except (ClientError, asyncio.TimeoutError, ValueError) as exc:
+                    _LOG.warning("Streamoji saved-avatar diagnostic failed: %s", exc)
+                _LOG.warning("Streamoji config 404 diagnostic: avatar_id=%s saved_for_token=%s",
+                             avatar_id, saved_match)
             if response.status >= 400:
                 _LOG.warning("Streamoji avatar upstream returned HTTP %s for %s (avatar_id=%s)",
                              response.status, action, avatar_id or "n/a")
             content_type = response.headers.get("Content-Type", "application/json")
             return web.Response(body=result, status=response.status,
-                                headers={"Cache-Control": "no-store", "Content-Type": content_type})
+                                headers={"Cache-Control": "no-store", "Content-Type": content_type,
+                                         "X-Streamoji-Saved-Avatar-Match": saved_match})
     except (ClientError, asyncio.TimeoutError) as exc:
         _LOG.warning("Streamoji avatar relay %s failed: %s", action, exc)
         raise web.HTTPBadGateway(text="Streamoji avatar service is unavailable") from exc
