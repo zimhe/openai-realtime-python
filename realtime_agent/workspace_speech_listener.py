@@ -86,9 +86,13 @@ class SpeakerAsrSession:
     ):
         self.uid = uid
         self.on_text = on_text
-        self.api_key = os.getenv("VOLCENGINE_API_KEY", "").strip()
+        self.auth_mode = os.getenv("VOLCENGINE_ASR_AUTH_MODE", "api_key").strip().lower()
+        self.api_key = (os.getenv("VOLCENGINE_ASR_API_KEY") or
+                        os.getenv("VOLCENGINE_API_KEY", "")).strip()
         self.app_id = os.getenv("VOLCENGINE_APP_ID", "").strip()
         self.access_key = os.getenv("VOLCENGINE_ACCESS_KEY", "").strip()
+        if self.auth_mode == "legacy":
+            self.api_key = ""
         if not self.api_key and not (self.app_id and self.access_key):
             raise ValueError("Volcengine ASR requires VOLCENGINE_API_KEY or legacy app credentials")
         self.resource_id = os.getenv("VOLCENGINE_ASR_RESOURCE_ID", ASR_RESOURCE_ID)
@@ -105,6 +109,7 @@ class SpeakerAsrSession:
         headers = {
             "X-Api-Resource-Id": self.resource_id,
             "X-Api-Connect-Id": str(uuid.uuid4()),
+            "X-Api-Request-Id": str(uuid.uuid4()),
         }
         if self.api_key:
             headers["X-Api-Key"] = self.api_key
@@ -134,6 +139,14 @@ class SpeakerAsrSession:
             }
             await self._send_frame(1, json.dumps(request).encode("utf-8"), json_body=True)
             self.reader = asyncio.create_task(self._read_loop())
+        except aiohttp.WSServerHandshakeError as exc:
+            log_id = exc.headers.get("X-Tt-Logid", "") if exc.headers else ""
+            await self.close()
+            raise RuntimeError(
+                f"ASR handshake HTTP {exc.status}; resource_id={self.resource_id}; "
+                f"auth={'api_key' if self.api_key else 'legacy_app_credentials'}; "
+                f"log_id={log_id or 'unavailable'}"
+            ) from exc
         except BaseException:
             await self.close()
             raise
