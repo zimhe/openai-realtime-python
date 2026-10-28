@@ -165,6 +165,9 @@ async def proxy_streamoji_avatar(request: web.Request) -> web.Response:
         async with session.request(method, url, params={"avatarId": avatar_id} if avatar_id else None,
                                    data=body, headers=headers, allow_redirects=False) as response:
             result = await response.read()
+            if response.status >= 400:
+                _LOG.warning("Streamoji avatar upstream returned HTTP %s for %s (avatar_id=%s)",
+                             response.status, action, avatar_id or "n/a")
             content_type = response.headers.get("Content-Type", "application/json")
             return web.Response(body=result, status=response.status,
                                 headers={"Cache-Control": "no-store", "Content-Type": content_type})
